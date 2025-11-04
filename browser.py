@@ -1,5 +1,5 @@
 # browser_chrome_tabs_api.py
-import socket, ssl, sys, tkinter, tkinter.font
+import socket, ssl, sys, urllib.parse, tkinter, tkinter.font
 
 # ================= Networking =================
 class URL:
@@ -14,13 +14,23 @@ class URL:
             self.host, p = self.host.split(":", 1)
             self.port = int(p)
 
-    def request(self):
+    def request(self, payload=None):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         s.connect((self.host, self.port))
         if self.scheme == "https":
             ctx = ssl.create_default_context()
             s = ctx.wrap_socket(s, server_hostname=self.host)
-        req = f"GET {self.path} HTTP/1.0\r\nHost: {self.host}\r\n\r\n"
+
+        method = "POST" if payload is not None else "GET"
+        req = f"{method} {self.path} HTTP/1.0\r\nHost: {self.host}\r\n"
+        if payload is not None:
+            length = len(payload.encode("utf8"))
+            req += "Content-Type: application/x-www-form-urlencoded\r\n"
+            req += f"Content-Length: {length}\r\n"
+        req += "\r\n"
+        if payload is not None:
+            req += payload
+
         s.send(req.encode("utf8"))
         resp = s.makefile("r", encoding="utf8", newline="\r\n")
         _ = resp.readline()
@@ -63,6 +73,7 @@ class Text:
         self.children = []
         self.parent = parent
         self.style = {}
+        self.is_focused = False
     def __repr__(self): return repr(self.text)
 
 class Element:
@@ -72,6 +83,7 @@ class Element:
         self.children = []
         self.parent = parent
         self.style = {}
+        self.is_focused = False
     def __repr__(self): return "<" + self.tag + ">"
 
 def print_tree(node, indent=0):
@@ -209,6 +221,11 @@ DEFAULT_STYLE_SHEET = [
     (TagSelector("body"), {"background-color": "white", "color": "black"}),
     (TagSelector("pre"),  {"background-color": "gray"}),
     (DescendantSelector(TagSelector("body"), TagSelector("a")), {"color": "blue"}),
+    # Widgets
+    (TagSelector("input"),  {"font-size": "16px", "font-weight": "normal", "font-style": "normal",
+                             "background-color": "lightblue", "color": "black"}),
+    (TagSelector("button"), {"font-size": "16px", "font-weight": "normal", "font-style": "normal",
+                             "background-color": "orange", "color": "black"}),
     (TagSelector("i"),    {"font-style": "italic"}),
     (TagSelector("b"),    {"font-weight": "bold"}),
     (TagSelector("small"),{"font-size": "90%"}),
@@ -229,6 +246,8 @@ WIDTH, HEIGHT = 800, 600
 HSTEP, VSTEP = 13, 18
 SCROLL_STEP = 100
 SCROLLBAR_WIDTH = 12
+INPUT_WIDTH_PX = 200
+CHECKBOX_SIZE = 16
 
 BLOCK_ELEMENTS = [
     "html","body","article","section","nav","aside",
@@ -251,17 +270,14 @@ def style(node, rules):
     for prop, default_value in INHERITED_PROPERTIES.items():
         if node.parent: node.style[prop] = node.parent.style[prop]
         else: node.style[prop] = default_value
-
     for selector, body in rules:
         if selector.matches(node):
             for p, v in body.items():
                 node.style[p] = v
-
     if node.style["font-size"].endswith("%"):
         parent_px = float((node.parent.style["font-size"] if node.parent else INHERITED_PROPERTIES["font-size"])[:-2])
         node_pct = float(node.style["font-size"][:-1]) / 100
         node.style["font-size"] = str(node_pct * parent_px) + "px"
-
     for c in node.children:
         style(c, rules)
 
@@ -280,6 +296,7 @@ class DocumentLayout:
         child.layout()
         self.height = child.height
     def paint(self): return []
+    def should_paint(self): return True
 
 class BlockLayout:
     def __init__(self, node, parent, previous):
@@ -287,7 +304,7 @@ class BlockLayout:
         self.parent = parent
         self.previous = previous
         self.children = []
-        self.display_list = []  # (x,y,word,font,color)
+        self.display_list = []  # tuples for inline items
         self.x = self.y = self.width = self.height = None
         self.cursor_x = self.cursor_y = 0
         self.weight = "normal"; self.style = "roman"; self.size = 12
@@ -296,14 +313,14 @@ class BlockLayout:
     def layout_mode(self):
         if isinstance(self.node, Text): return "inline"
         elif any(isinstance(c, Element) and c.tag in BLOCK_ELEMENTS for c in self.node.children): return "block"
-        elif self.node.children: return "inline"
+        elif self.node.children or (isinstance(self.node, Element) and self.node.tag in ["input","button"]):
+            return "inline"
         else: return "block"
 
     def layout(self):
         self.x = self.parent.x
         self.width = self.parent.width
         self.y = (self.previous.y + self.previous.height) if self.previous else self.parent.y
-
         mode = self.layout_mode()
         if mode == "block":
             prev = None
@@ -324,7 +341,7 @@ class BlockLayout:
             self.height = sum(ch.height for ch in self.children) if self.children else VSTEP
         else:
             if self.display_list:
-                any_font = self.display_list[0][3]
+                any_font = self.display_list[0][3] if self.display_list[0][0] == "text" else get_font(12,"normal","roman")
                 self.height = (self.display_list[-1][1] - self.y) + any_font.metrics("linespace")
             else:
                 self.height = VSTEP
@@ -334,8 +351,14 @@ class BlockLayout:
             for w in node.text.split():
                 self.word(node, w)
         else:
-            for c in node.children:
-                self.recurse(c)
+            if isinstance(node, Element) and node.tag in ["input","button","br"]:
+                if node.tag == "br":
+                    self.flush()
+                else:
+                    self.input(node)
+            else:
+                for c in node.children:
+                    self.recurse(c)
 
     def word(self, node, word):
         weight = node.style["font-weight"]
@@ -347,31 +370,106 @@ class BlockLayout:
         w = font.measure(word)
         if self.cursor_x + w > self.width:
             self.flush()
-        self.line.append((self.cursor_x, word, font, color))
+        self.line.append(("text", self.cursor_x, word, font, color))
         self.cursor_x += w + font.measure(" ")
+
+    def input(self, node):
+        # compute font used inside widget
+        weight = node.style["font-weight"]
+        style = node.style["font-style"]
+        if style == "normal": style = "roman"
+        size = int(float(node.style["font-size"][:-2]) * .75)
+        font = get_font(size, weight, style)
+
+        # size by type
+        is_checkbox = node.attributes.get("type","text").lower() == "checkbox"
+        w = CHECKBOX_SIZE if is_checkbox else (INPUT_WIDTH_PX if node.tag == "input" else max(80, font.measure(self.button_label(node)) + 20))
+
+        if self.cursor_x + w > self.width:
+            self.flush()
+
+        metrics = font.metrics()
+        max_ascent = metrics["ascent"]
+        baseline = self.cursor_y + max_ascent
+        x = self.x + self.cursor_x
+        y_top = self.y + baseline - font.metrics("ascent")
+        y_bottom = y_top + (CHECKBOX_SIZE if is_checkbox else font.metrics("linespace"))
+        rect = (x, y_top, x + w, y_bottom)
+
+        # register for hit-testing
+        Browser._register_widget_box(node, rect)
+
+        # background/box
+        if is_checkbox:
+            # draw a square outline; fill light background
+            self.display_list.append(("rect", rect, "#e6f2ff"))
+            self.display_list.append(("outline", rect, "black", 1))
+            # draw check if checked
+            checked = ("checked" in node.attributes) or (node.attributes.get("_checked_state") == "true")
+            if checked:
+                # simple X check
+                self.display_list.append(("line", (x+3, y_top+3, x+w-3, y_bottom-3, "black", 2)))
+                self.display_list.append(("line", (x+w-3, y_top+3, x+3, y_bottom-3, "black", 2)))
+        else:
+            bgcolor = node.style.get("background-color", "transparent")
+            if bgcolor != "transparent":
+                self.display_list.append(("rect", rect, bgcolor))
+
+            if node.tag == "input":
+                text = node.attributes.get("value", "")
+            else:
+                text = self.button_label(node)
+            color = node.style["color"]
+            self.display_list.append(("text_abs", (x, y_top), text, font, color))
+            if node.is_focused and node.tag == "input":
+                cx = x + font.measure(text)
+                self.display_list.append(("line", (cx, y_top, cx, y_bottom, "black", 1)))
+
+        # advance cursor
+        self.cursor_x += w + font.measure(" ")
+
+    def button_label(self, node):
+        if len(node.children) == 1 and isinstance(node.children[0], Text):
+            return node.children[0].text
+        return ""
 
     def flush(self):
         if not self.line: return
-        metrics = [font.metrics() for _, _, font, _ in self.line]
+        metrics = [font.metrics() for _, _, _, font, _ in self.line]
         max_ascent = max(m["ascent"] for m in metrics)
         max_descent = max(m["descent"] for m in metrics)
         baseline = self.cursor_y + max_ascent
-        for rel_x, word, font, color in self.line:
+        for kind, rel_x, word, font, color in self.line:
             x = self.x + rel_x
             y = self.y + baseline - font.metrics("ascent")
-            self.display_list.append((x, y, word, font, color))
+            self.display_list.append(("text_abs", (x, y), word, font, color))
         self.cursor_y = baseline + int(1.25 * max_descent)
         self.cursor_x = 0
         self.line = []
+
+    def should_paint(self):
+        if isinstance(self.node, Element) and self.node.tag in ["input","button"]:
+            return False
+        return True
 
     def paint(self):
         cmds = []
         if isinstance(self.node, Element) and self.node.tag == "pre":
             x2, y2 = self.x + self.width, self.y + self.height
             cmds.append(DrawRect(self.x, self.y, x2, y2, "gray"))
-        if self.layout_mode() == "inline":
-            for x, y, word, font, color in self.display_list:
+        for item in self.display_list:
+            if item[0] == "text_abs":
+                _, (x,y), word, font, color = item
                 cmds.append(DrawText(x, y, word, font, color))
+            elif item[0] == "rect":
+                _, (x1,y1,x2,y2), color = item
+                cmds.append(DrawRect(x1, y1, x2, y2, color))
+            elif item[0] == "line":
+                _, (x1,y1,x2,y2,color,th) = item
+                cmds.append(DrawLine(x1, y1, x2, y2, color, th))
+            elif item[0] == "outline":
+                _, (x1,y1,x2,y2), color, th = item
+                cmds.append(DrawOutline(x1, y1, x2, y2, color, th))
         return cmds
 
 # ================= Draw commands + geometry shims =================
@@ -417,7 +515,10 @@ class DrawOutline:
                                 outline=self.color, width=self.thickness)
 
 def paint_tree(layout_object, display_list):
-    display_list.extend(layout_object.paint())
+    if hasattr(layout_object, "should_paint") and not layout_object.should_paint():
+        pass
+    else:
+        display_list.extend(layout_object.paint())
     for child in layout_object.children:
         paint_tree(child, display_list)
 
@@ -425,7 +526,7 @@ def paint_tree(layout_object, display_list):
 class Tab:
     def __init__(self, browser, home_url=None):
         self.browser = browser
-        self.history = []
+        self.history = []            # list of dicts: {url, method, body}
         self.history_index = -1
         self.nodes = None
         self.document = None
@@ -433,57 +534,70 @@ class Tab:
         self.scroll = 0
         self.doc_height = HEIGHT
         self.title = "New Tab"
-        # no navigation here; Browser.new_tab will call navigate
+        self.focus = None            # focused input Element
+        self.url = None              # current page URL
+        if home_url: self.navigate(home_url)
 
-    def navigate(self, url):
+    def navigate(self, url, method="GET", body=None):
+        # trim forward history
         if self.history_index + 1 < len(self.history):
             self.history = self.history[:self.history_index + 1]
-        self.history.append(url)
+        self.history.append({"url": url, "method": method, "body": body})
         self.history_index += 1
-        self.load(url)
+        self.load(url, payload=(body if method == "POST" else None))
 
     def go_back(self):
         if self.history_index > 0:
             self.history_index -= 1
-            self.load(self.history[self.history_index], push_history=False)
+            self._restore_history_entry()
 
     def go_forward(self):
         if self.history_index + 1 < len(self.history):
             self.history_index += 1
-            self.load(self.history[self.history_index], push_history=False)
+            self._restore_history_entry()
 
     def reload(self):
         if 0 <= self.history_index < len(self.history):
-            self.load(self.history[self.history_index], push_history=False)
+            entry = self.history[self.history_index]
+            # 8-5: Do not re-POST on reload; reload with GET
+            self.load(entry["url"], payload=None)
 
-    def load(self, url, push_history=True):
+    def _restore_history_entry(self):
+        entry = self.history[self.history_index]
+        # 8-5 safety: never auto re-POST on history nav; do GET instead
+        self.load(entry["url"], payload=None)
+
+    def load(self, url, payload=None):
         try:
             self.browser.set_status("Loading…")
-            body = url.request()
+            body = url.request(payload)
             self.browser.set_status("")
         except Exception as ex:
             self.browser.set_status(f"Network error: {ex}")
             return
-
+        self.url = url
         self.nodes = HTMLParser(body).parse()
         self.title = self._extract_title() or f"{url.host}"
-
+        # Style rules
         rules = DEFAULT_STYLE_SHEET[:]
         rules.sort(key=cascade_priority)
         style(self.nodes, rules)
-
-        self.document = DocumentLayout(self.nodes)
-        self.document.layout()
-        self.display_list = []
-        paint_tree(self.document, self.display_list)
-        self.doc_height = self.document.height
-        self.scroll = 0
-
+        # Render
+        self.render()
         if self is self.browser.current_tab():
             self.browser.address.delete(0, "end")
             self.browser.address.insert(0, str(url))
             self.browser.draw()
             self.browser.refresh_tab_strip()
+
+    def render(self):
+        Browser._clear_widget_boxes()
+        self.document = DocumentLayout(self.nodes)
+        self.document.layout()
+        self.display_list = []
+        paint_tree(self.document, self.display_list)
+        self.doc_height = self.document.height
+        self.scroll = min(self.scroll, max(0, self.doc_height - HEIGHT))
 
     def _extract_title(self):
         def walk(n):
@@ -509,10 +623,95 @@ class Tab:
     def scrollup(self, step=SCROLL_STEP):
         self.scroll -= step; self.clamp_scroll()
 
+    # ---- input focus, typing, clicking ----
+    def click(self, x, y):
+        doc_y = y + self.scroll
+        elt = Browser._hit_widget(x, doc_y)
+
+        # blur previous focus
+        self.blur()
+
+        if elt is not None:
+            if elt.tag == "input":
+                # checkbox click toggles; text input focuses
+                if elt.attributes.get("type","text").lower() == "checkbox":
+                    # toggle internal checked state
+                    if ("checked" in elt.attributes) or (elt.attributes.get("_checked_state") == "true"):
+                        # uncheck
+                        if "checked" in elt.attributes: del elt.attributes["checked"]
+                        elt.attributes["_checked_state"] = "false"
+                    else:
+                        elt.attributes["_checked_state"] = "true"
+                    self.render()
+                    return
+                # text input focus & clear
+                elt.attributes["value"] = ""
+                self.focus = elt
+                elt.is_focused = True
+                self.render()
+                return
+            elif elt.tag == "button":
+                form = elt.parent
+                while form and not (isinstance(form, Element) and form.tag == "form"):
+                    form = form.parent
+                if form:
+                    self.submit_form(form)
+                    return
+
+        self.render()
+
+    def keypress(self, char):
+        if self.focus and isinstance(self.focus, Element) and self.focus.tag == "input":
+            if char == "\r" or char == "\n":
+                # 8-1: Enter submits enclosing form
+                form = self.focus.parent
+                while form and not (isinstance(form, Element) and form.tag == "form"):
+                    form = form.parent
+                if form:
+                    self.submit_form(form)
+                return
+            # simple text append (backspace etc. omitted for brevity)
+            self.focus.attributes["value"] = self.focus.attributes.get("value", "") + char
+            self.render()
+
+    def submit_form(self, form_elt):
+        # Collect inputs
+        inputs = [n for n in tree_to_list(form_elt, [])
+                  if isinstance(n, Element) and n.tag == "input" and "name" in n.attributes]
+
+        parts = []
+        for inp in inputs:
+            itype = inp.attributes.get("type","text").lower()
+            if itype == "checkbox":
+                checked = ("checked" in inp.attributes) or (inp.attributes.get("_checked_state") == "true")
+                if not checked:
+                    continue  # include only if checked
+                name = urllib.parse.quote(inp.attributes["name"])
+                value = urllib.parse.quote(inp.attributes.get("value","on"))
+                parts.append(f"{name}={value}")
+            else:
+                name = urllib.parse.quote(inp.attributes["name"])
+                value = urllib.parse.quote(inp.attributes.get("value",""))
+                parts.append(f"{name}={value}")
+        body = "&".join(parts)
+
+        action = form_elt.attributes.get("action","")
+        url = self.url.resolve(action)
+        # record as POST in history (8-5)
+        self.navigate(url, method="POST", body=body)
+
+    def blur(self):
+        # 8-3: clear tab focus & caret
+        if self.focus:
+            self.focus.is_focused = False
+            self.focus = None
+
 # ================= Chrome shim (optional) =================
 class Chrome:
     def __init__(self, browser):
         self.browser = browser
+        self.focus = None
+        self.bottom = 0
     def tab_rect(self, i):
         x0 = 6 + i * 140
         return Rect(x0, 2, x0 + 128, 28)
@@ -522,14 +721,35 @@ class Chrome:
             r = self.tab_rect(i)
             if r.contains_point(x, y):
                 self.browser.switch_tab(i); return
-    def keypress(self, char): self.browser.address.insert("end", char)
-    def enter(self): self.browser.go_address()
+    def keypress(self, char):
+        if self.focus == "address bar":
+            self.browser.address.insert("end", char)
+            return True
+        return False
+    def enter(self):
+        self.browser.go_address()
+    def blur(self):
+        self.focus = None
 
 # ================= Browser (chrome + tabs) =================
 class Browser:
+    _widget_boxes = []  # (rect, element)
+    @classmethod
+    def _register_widget_box(cls, element, rect_tuple):
+        x1,y1,x2,y2 = rect_tuple
+        cls._widget_boxes.append((Rect(x1,y1,x2,y2), element))
+    @classmethod
+    def _clear_widget_boxes(cls):
+        cls._widget_boxes = []
+    @classmethod
+    def _hit_widget(cls, x, y):
+        for r, elt in reversed(cls._widget_boxes):
+            if r.contains_point(x, y):
+                return elt
+        return None
+
     def __init__(self):
         self.window = tkinter.Tk()
-
         self.chrome_ctl = Chrome(self)
 
         # --- tab strip ---
@@ -551,6 +771,7 @@ class Browser:
         self.address.pack(side="left", fill="x", expand=True, padx=4)
         self.go_btn.pack(side="left")
         self.chrome.pack(fill="x")
+        self.chrome_ctl.bottom = self.chrome.winfo_reqheight() + self.tabbar.winfo_reqheight()
 
         # --- canvas ---
         self.canvas = tkinter.Canvas(self.window, width=WIDTH, height=HEIGHT,
@@ -562,7 +783,7 @@ class Browser:
         self.status.pack(fill="x")
 
         # bindings
-        self.window.bind("<Return>", lambda e: self.go_address())
+        self.window.bind("<Return>", lambda e: self.handle_enter())
         self.window.bind("<Down>",   lambda e: self.scroll_active(+SCROLL_STEP))
         self.window.bind("<Up>",     lambda e: self.scroll_active(-SCROLL_STEP))
         self.window.bind("<Prior>",  lambda e: self.scroll_active(-int(HEIGHT*0.9)))
@@ -570,36 +791,31 @@ class Browser:
         self.window.bind("<MouseWheel>", self.on_wheel)
         self.canvas.bind("<Button-4>", self.on_wheel_linux)
         self.canvas.bind("<Button-5>", self.on_wheel_linux)
+        self.canvas.bind("<Button-1>", self.handle_click)
+        self.window.bind("<Key>", self.handle_key)
 
         # keyboard shortcuts (Ctrl/Cmd)
         self._bind_accels()
 
-        # create first tab (navigate after append)
+        # first tab
         self.new_tab(URL("https://browser.engineering/chrome.html"))
 
     # -------- accelerators --------
     def _bind_accels(self):
-        # helper to bind both Ctrl (Windows/Linux) and Command (macOS)
         def bind_combo(key, handler):
             self.window.bind(f"<Control-{key}>", handler)
             self.window.bind(f"<Command-{key}>", handler)
-
         bind_combo("t", lambda e: self.new_tab(URL("https://example.org/")))
         bind_combo("w", lambda e: self.close_tab(self.active_tab_index))
         bind_combo("l", lambda e: (self.address.focus_set(), self.address.selection_range(0, "end")))
-
-        # next / previous tab
         def next_tab(e=None):
             if self.tabs:
                 self.switch_tab((self.active_tab_index + 1) % len(self.tabs))
         def prev_tab(e=None):
             if self.tabs:
                 self.switch_tab((self.active_tab_index - 1) % len(self.tabs))
-
-        # Ctrl-Tab / Ctrl-Shift-Tab (Windows/Linux)
         self.window.bind("<Control-Tab>", lambda e: next_tab())
         self.window.bind("<Control-Shift-Tab>", lambda e: prev_tab())
-        # Command-Option-Right/Left (mac-ish fallback)
         self.window.bind("<Command-Right>", lambda e: next_tab())
         self.window.bind("<Command-Left>",  lambda e: prev_tab())
 
@@ -621,7 +837,7 @@ class Browser:
             self.active_tab_index = idx
             tab = self.current_tab()
             if 0 <= tab.history_index < len(tab.history):
-                url = tab.history[tab.history_index]
+                url = tab.history[tab.history_index]["url"]
                 self.address.delete(0, "end")
                 self.address.insert(0, str(url))
             self.refresh_tab_strip()
@@ -641,18 +857,15 @@ class Browser:
         self.draw()
 
     def refresh_tab_strip(self):
-        # rebuild the tab bar with a title button + tiny close button per tab
         for w in self.tabbar.winfo_children(): w.destroy()
         for i, t in enumerate(self.tabs):
             cell = tkinter.Frame(self.tabbar, bd=0, relief="flat", bg="#e6e6e6")
-            # title button
             title = t.title or "New Tab"
             title_txt = title[:24] + ("…" if len(title) > 24 else "")
             b = tkinter.Button(cell, text=title_txt,
                                command=lambda j=i: self.switch_tab(j),
                                relief="sunken" if i == self.active_tab_index else "raised")
             b.pack(side="left", padx=(2,2), pady=2)
-            # close button ×
             xbtn = tkinter.Button(cell, text="×", width=2,
                                   command=lambda j=i: self.close_tab(j))
             xbtn.pack(side="left", padx=(2,4), pady=2)
@@ -661,10 +874,42 @@ class Browser:
                               command=lambda: self.new_tab(URL("https://example.org/")))
         plus.pack(side="left", padx=4, pady=2)
 
+    # -------- focus & events --------
+    def handle_click(self, e):
+        # clicking the page: blur address-bar focus and blur tab focus first
+        self.address.selection_clear()
+        self.address.icursor("end")
+        self.chrome_ctl.blur()
+        self.current_tab().blur()  # 8-3: ensure only one caret ever
+        self.current_tab().click(e.x, e.y)
+        self.draw()
+
+    def handle_key(self, e):
+        widget = self.window.focus_get()
+        if widget is self.address:
+            # address bar focused; page must be blurred
+            self.chrome_ctl.focus = "address bar"
+            self.current_tab().blur()  # 8-3
+            return
+        self.chrome_ctl.focus = None
+        if e.char:
+            self.current_tab().keypress(e.char)
+            self.draw()
+
+    def handle_enter(self):
+        widget = self.window.focus_get()
+        if widget is self.address:
+            self.go_address()
+        else:
+            # enter in page is handled by Tab.keypress
+            pass
+
     # -------- chrome actions --------
     def set_status(self, msg): self.status.config(text=msg)
 
     def go_address(self):
+        # blur page when switching to navigation via address bar
+        self.current_tab().blur()  # 8-3
         url_str = self.address.get().strip()
         if not url_str: return
         if "://" not in url_str:

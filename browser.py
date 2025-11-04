@@ -1,6 +1,9 @@
+# browser2.py
 import socket
 import ssl
+import tkinter
 
+# ---------- Networking ----------
 class URL:
     def __init__(self, url):
         self.scheme, url = url.split("://", 1)
@@ -13,7 +16,7 @@ class URL:
 
         if self.scheme == "http":
             self.port = 80
-        elif self.scheme == "https":
+        else:
             self.port = 443
 
         if ":" in self.host:
@@ -43,7 +46,8 @@ class URL:
         response_headers = {}
         while True:
             line = response.readline()
-            if line == "\r\n": break
+            if line == "\r\n":
+                break
             header, value = line.split(":", 1)
             response_headers[header.casefold()] = value.strip()
 
@@ -54,7 +58,11 @@ class URL:
         s.close()
         return content
 
-def show(body):
+# ---------- Text extraction ----------
+def lex(body):
+    # Turn the HTML string into just visible text,
+    # but return a string instead of printing.
+    text = ""
     in_tag = False
     for c in body:
         if c == "<":
@@ -62,12 +70,64 @@ def show(body):
         elif c == ">":
             in_tag = False
         elif not in_tag:
-            print(c, end="")
+            text += c
+    return text
 
-def load(url):
-    body = url.request()
-    show(body)
+# ---------- Layout constants ----------
+WIDTH, HEIGHT = 800, 600     # Canvas size
+HSTEP, VSTEP = 13, 18        # Character advance (rough)
+SCROLL_STEP = 100            # Pixels per Down-arrow press
 
+# ---------- Build a display list of positioned characters ----------
+def layout(text):
+    display_list = []
+    cursor_x, cursor_y = HSTEP, VSTEP
+    for c in text:
+        # Add (x, y, char)
+        display_list.append((cursor_x, cursor_y, c))
+        cursor_x += HSTEP
+        # Wrap to next line at right edge
+        if cursor_x >= WIDTH - HSTEP:
+            cursor_y += VSTEP
+            cursor_x = HSTEP
+    return display_list
+
+# ---------- GUI Browser ----------
+class Browser:
+    def __init__(self):
+        self.window = tkinter.Tk()
+        self.canvas = tkinter.Canvas(self.window, width=WIDTH, height=HEIGHT)
+        self.canvas.pack()
+        self.scroll = 0
+        self.display_list = []
+        # Bind Down Arrow for scrolling
+        self.window.bind("<Down>", self.scrolldown)
+
+    def load(self, url):
+        body = url.request()           # fetch HTML
+        text = lex(body)               # extract visible text
+        self.display_list = layout(text)
+        self.draw()
+
+    def draw(self):
+        self.canvas.delete("all")      # clear previous frame
+        for x, y, c in self.display_list:
+            # Cull offscreen rows for speed
+            if y > self.scroll + HEIGHT:
+                continue
+            if y + VSTEP < self.scroll:
+                continue
+            self.canvas.create_text(x, y - self.scroll, text=c)
+
+    def scrolldown(self, e):
+        self.scroll += SCROLL_STEP
+        self.draw()
+
+# ---------- CLI ----------
 if __name__ == "__main__":
     import sys
-    load(URL(sys.argv[1]))
+    if len(sys.argv) != 2:
+        print("Usage: python3 browser2.py <URL>")
+        sys.exit(1)
+    Browser().load(URL(sys.argv[1]))
+    tkinter.mainloop()

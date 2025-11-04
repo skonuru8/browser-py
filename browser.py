@@ -216,6 +216,103 @@ def cascade_priority(rule):
     selector, _ = rule
     return selector.priority
 
+class CSSParser:
+    def __init__(self, s: str) -> None:
+        self.s = s
+        self.i = 0
+
+    def whitespace(self) -> None:
+        # Skip over any whitespace
+        while self.i < len(self.s) and self.s[self.i].isspace():
+            self.i += 1
+
+    def literal(self, literal: str) -> None:
+        # Consume a specific character
+        if not (self.i < len(self.s) and self.s[self.i] == literal):
+            raise Exception(f"Expected '{literal}'")
+        self.i += 1
+
+    def word(self) -> str:
+        # Parse a CSS identifier/number/colour
+        start = self.i
+        while self.i < len(self.s) and (
+            self.s[self.i].isalnum() or self.s[self.i] in "#-.%"
+        ):
+            self.i += 1
+        if not (self.i > start):
+            raise Exception("Expected word")
+        return self.s[start:self.i]
+
+    def ignore_until(self, chars: list[str]) -> str | None:
+        # Skip characters until encountering one of the delimiters
+        while self.i < len(self.s):
+            if self.s[self.i] in chars:
+                return self.s[self.i]
+            self.i += 1
+        return None
+
+    def pair(self) -> tuple[str, str]:
+        # Parse one `property: value;`
+        prop = self.word()
+        self.whitespace()
+        self.literal(":")
+        self.whitespace()
+        val = self.word()
+        return prop.casefold(), val
+
+    def body(self) -> dict[str, str]:
+        # Parse a sequence of property–value pairs
+        pairs: dict[str, str] = {}
+        while self.i < len(self.s) and self.s[self.i] != "}":
+            try:
+                prop, val = self.pair()
+                pairs[prop] = val
+                self.whitespace()
+                self.literal(";")
+                self.whitespace()
+            except Exception:
+                # Skip malformed declarations until ';' or '}'
+                why = self.ignore_until([";", "}"])
+                if why == ";":
+                    self.literal(";")
+                    self.whitespace()
+                else:
+                    break
+        return pairs
+
+    def selector(self):
+        # Parse a tag selector with optional descendant selectors
+        out = TagSelector(self.word().casefold())
+        self.whitespace()
+        while self.i < len(self.s) and self.s[self.i] != "{":
+            tag = self.word()
+            descendant = TagSelector(tag.casefold())
+            out = DescendantSelector(out, descendant)
+            self.whitespace()
+        return out
+
+    def parse(self) -> list[tuple[object, dict[str, str]]]:
+        # Parse an entire style sheet into a list of (selector, declarations)
+        rules: list[tuple[object, dict[str, str]]] = []
+        while self.i < len(self.s):
+            try:
+                self.whitespace()
+                selector = self.selector()
+                self.literal("{")
+                self.whitespace()
+                body = self.body()
+                self.literal("}")
+                rules.append((selector, body))
+            except Exception:
+                # Skip malformed rules:contentReference[oaicite:2]{index=2}
+                why = self.ignore_until(["}"])
+                if why == "}":
+                    self.literal("}")
+                    self.whitespace()
+                else:
+                    break
+        return rules
+
 # UA stylesheet as Python objects (robust)
 DEFAULT_STYLE_SHEET = [
     (TagSelector("body"), {"background-color": "white", "color": "black"}),
@@ -231,6 +328,13 @@ DEFAULT_STYLE_SHEET = [
     (TagSelector("small"),{"font-size": "90%"}),
     (TagSelector("big"),  {"font-size": "110%"}),
 ]
+
+# ================= Geometry classes =================
+class Rect:
+    def __init__(self, left, top, right, bottom):
+        self.left, self.top, self.right, self.bottom = left, top, right, bottom
+    def contains_point(self, x, y):
+        return self.left <= x <= self.right and self.top <= y <= self.bottom
 
 # ================= Fonts & layout =================
 FONTS = {}
@@ -491,13 +595,159 @@ class BlockLayout:
                 _, (x1,y1,x2,y2), color, th = item
                 cmds.append(DrawOutline(x1, y1, x2, y2, color, th))
         return cmds
+    
+    def new_line(self) -> None:
+        """Start a new LineLayout when the current line overflows:contentReference[oaicite:8]{index=8}."""
+        self.cursor_x = 0
+        previous_line = self.children[-1] if self.children else None
+        self.children.append(LineLayout(self.node, self, previous_line))
 
-# ================= Draw commands + geometry shims =================
-class Rect:
-    def __init__(self, left, top, right, bottom):
-        self.left, self.top, self.right, self.bottom = left, top, right, bottom
-    def contains_point(self, x, y):
-        return self.left <= x <= self.right and self.top <= y <= self.bottom
+    def self_rect(self) -> Rect:
+        """Return the block’s bounding rectangle for background painting."""
+        return Rect(self.x, self.y, self.x + self.width, self.y + self.height)
+
+class LineLayout:
+    def __init__(self, node, parent, previous):
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children: list[object] = []
+        self.x = self.y = 0
+        self.width = self.height = 0
+
+    def layout(self):
+        # Lines span the full width of the parent block
+        self.width = self.parent.width
+        self.x = self.parent.x
+        # Stack vertically below the previous line:contentReference[oaicite:3]{index=3}
+        if self.previous:
+            self.y = self.previous.y + self.previous.height
+        else:
+            self.y = self.parent.y
+        # Lay out children (TextLayout or InputLayout)
+        for child in self.children:
+            child.layout()
+        if not self.children:
+            self.height = 0
+            return
+        # Compute baseline from maximum ascents/descents:contentReference[oaicite:4]{index=4}
+        max_ascent = max(child.font.metrics("ascent") for child in self.children)
+        max_descent = max(child.font.metrics("descent") for child in self.children)
+        baseline = self.y + max_ascent
+        for child in self.children:
+            child.y = baseline - child.font.metrics("ascent")
+        self.height = 1.25 * (max_ascent + max_descent)
+
+    def paint(self) -> list:
+        # Lines themselves draw nothing; children handle painting
+        return []
+
+    def should_paint(self) -> bool:
+        return True
+
+
+class TextLayout:
+    """A single word within a line."""
+    def __init__(self, node, word, parent, previous):
+        self.node = node
+        self.word = word
+        self.parent = parent
+        self.previous = previous
+        self.children = []
+        self.x = self.y = 0
+        self.width = self.height = 0
+        self.font = None
+
+    def layout(self):
+        # Compute the font from inherited styles
+        weight = self.node.style.get("font-weight", "normal")
+        style = self.node.style.get("font-style", "normal")
+        if style == "normal":
+            style = "roman"
+        size = int(float(self.node.style.get("font-size", "16px")[:-2]) * 0.75)
+        self.font = get_font(size, weight, style)
+        self.width = self.font.measure(self.word)
+        # Place after previous word with a space:contentReference[oaicite:5]{index=5}
+        if self.previous:
+            space = self.previous.font.measure(" ")
+            self.x = self.previous.x + self.previous.width + space
+        else:
+            self.x = self.parent.x
+        self.height = self.font.metrics("linespace")
+
+    def paint(self) -> list:
+        color = self.node.style["color"]
+        return [DrawText(self.x, self.y, self.word, self.font, color)]
+
+    def should_paint(self) -> bool:
+        return True
+
+
+class InputLayout:
+    """
+    Layout object for <input> and <button> elements.  Draws a coloured
+    rectangle and the element’s value or label:contentReference[oaicite:6]{index=6}.
+    """
+    def __init__(self, node, parent, previous):
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children = []
+        self.x = self.y = 0
+        self.width = self.height = 0
+        self.font = None
+
+    def layout(self):
+        # Font for input or button
+        weight = self.node.style.get("font-weight", "normal")
+        style = self.node.style.get("font-style", "normal")
+        if style == "normal":
+            style = "roman"
+        size = int(float(self.node.style.get("font-size", "16px")[:-2]) * 0.75)
+        self.font = get_font(size, weight, style)
+        # Width: fixed for input; computed for button
+        if self.node.tag == "input":
+            self.width = INPUT_WIDTH_PX
+        else:
+            text = ""
+            if len(self.node.children) == 1 and isinstance(self.node.children[0], Text):
+                text = self.node.children[0].text
+            self.width = max(80, self.font.measure(text) + 20)
+        # Horizontal position
+        if self.previous:
+            space = self.previous.font.measure(" ")
+            self.x = self.previous.x + self.previous.width + space
+        else:
+            self.x = self.parent.x
+        # Height based on font
+        self.height = self.font.metrics("linespace")
+
+    def self_rect(self) -> Rect:
+        return Rect(self.x, self.y, self.x + self.width, self.y + self.height)
+
+    def paint(self) -> list:
+        cmds: list = []
+        # Background colour:contentReference[oaicite:7]{index=7}
+        bgcolor = self.node.style.get("background-color", "transparent")
+        if bgcolor != "transparent":
+            rect = self.self_rect()
+            cmds.append(DrawRect(rect.left, rect.top, rect.right, rect.bottom, bgcolor))
+        # Value (for <input>) or label (for <button>)
+        if self.node.tag == "input":
+            text = self.node.attributes.get("value", "")
+        else:
+            if len(self.node.children) == 1 and isinstance(self.node.children[0], Text):
+                text = self.node.children[0].text
+            else:
+                text = ""
+        cmds.append(DrawText(self.x, self.y, text, self.font, self.node.style["color"]))
+# ================= Draw commands =================
+class DrawText:
+    class Rect:
+        def __init__(self, left, top, right, bottom):
+            self.left, self.top, self.right, self.bottom = left, top, right, bottom
+        def contains_point(self, x, y):
+            return self.left <= x <= self.right and self.top <= y <= self.bottom
 
 class DrawText:
     def __init__(self, x1, y1, text, font, color):

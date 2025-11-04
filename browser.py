@@ -1,6 +1,14 @@
 # browser_chrome_tabs_api.py
 import socket, ssl, sys, urllib.parse, tkinter, tkinter.font
 
+# Optional dependency for JavaScript execution. DukPy wraps the Duktape
+# JavaScript engine. If it isn't available, interactive scripts will
+# not run. Exercises in Chapter 9 rely on this module.
+try:
+    import dukpy  # type: ignore
+except Exception:
+    dukpy = None
+
 # ================= Networking =================
 class URL:
     def __init__(self, url):
@@ -212,28 +220,27 @@ class DescendantSelector:
             node = node.parent
         return False
 
-def cascade_priority(rule):
-    selector, _ = rule
-    return selector.priority
-
 class CSSParser:
+    """
+    A very small CSS parser used for parsing author style sheets. It
+    supports tag and descendant selectors, and property/value pairs. The
+    parser skips malformed rules and continues parsing. See Chapter 6
+    exercises for details.
+    """
     def __init__(self, s: str) -> None:
         self.s = s
         self.i = 0
 
     def whitespace(self) -> None:
-        # Skip over any whitespace
         while self.i < len(self.s) and self.s[self.i].isspace():
             self.i += 1
 
     def literal(self, literal: str) -> None:
-        # Consume a specific character
         if not (self.i < len(self.s) and self.s[self.i] == literal):
             raise Exception(f"Expected '{literal}'")
         self.i += 1
 
     def word(self) -> str:
-        # Parse a CSS identifier/number/colour
         start = self.i
         while self.i < len(self.s) and (
             self.s[self.i].isalnum() or self.s[self.i] in "#-.%"
@@ -244,7 +251,6 @@ class CSSParser:
         return self.s[start:self.i]
 
     def ignore_until(self, chars: list[str]) -> str | None:
-        # Skip characters until encountering one of the delimiters
         while self.i < len(self.s):
             if self.s[self.i] in chars:
                 return self.s[self.i]
@@ -252,7 +258,6 @@ class CSSParser:
         return None
 
     def pair(self) -> tuple[str, str]:
-        # Parse one `property: value;`
         prop = self.word()
         self.whitespace()
         self.literal(":")
@@ -261,7 +266,6 @@ class CSSParser:
         return prop.casefold(), val
 
     def body(self) -> dict[str, str]:
-        # Parse a sequence of property–value pairs
         pairs: dict[str, str] = {}
         while self.i < len(self.s) and self.s[self.i] != "}":
             try:
@@ -271,7 +275,6 @@ class CSSParser:
                 self.literal(";")
                 self.whitespace()
             except Exception:
-                # Skip malformed declarations until ';' or '}'
                 why = self.ignore_until([";", "}"])
                 if why == ";":
                     self.literal(";")
@@ -281,7 +284,6 @@ class CSSParser:
         return pairs
 
     def selector(self):
-        # Parse a tag selector with optional descendant selectors
         out = TagSelector(self.word().casefold())
         self.whitespace()
         while self.i < len(self.s) and self.s[self.i] != "{":
@@ -292,7 +294,6 @@ class CSSParser:
         return out
 
     def parse(self) -> list[tuple[object, dict[str, str]]]:
-        # Parse an entire style sheet into a list of (selector, declarations)
         rules: list[tuple[object, dict[str, str]]] = []
         while self.i < len(self.s):
             try:
@@ -304,7 +305,6 @@ class CSSParser:
                 self.literal("}")
                 rules.append((selector, body))
             except Exception:
-                # Skip malformed rules:contentReference[oaicite:2]{index=2}
                 why = self.ignore_until(["}"])
                 if why == "}":
                     self.literal("}")
@@ -312,6 +312,10 @@ class CSSParser:
                 else:
                     break
         return rules
+
+def cascade_priority(rule):
+    selector, _ = rule
+    return selector.priority
 
 # UA stylesheet as Python objects (robust)
 DEFAULT_STYLE_SHEET = [
@@ -328,13 +332,6 @@ DEFAULT_STYLE_SHEET = [
     (TagSelector("small"),{"font-size": "90%"}),
     (TagSelector("big"),  {"font-size": "110%"}),
 ]
-
-# ================= Geometry classes =================
-class Rect:
-    def __init__(self, left, top, right, bottom):
-        self.left, self.top, self.right, self.bottom = left, top, right, bottom
-    def contains_point(self, x, y):
-        return self.left <= x <= self.right and self.top <= y <= self.bottom
 
 # ================= Fonts & layout =================
 FONTS = {}
@@ -595,159 +592,13 @@ class BlockLayout:
                 _, (x1,y1,x2,y2), color, th = item
                 cmds.append(DrawOutline(x1, y1, x2, y2, color, th))
         return cmds
-    
-    def new_line(self) -> None:
-        """Start a new LineLayout when the current line overflows:contentReference[oaicite:8]{index=8}."""
-        self.cursor_x = 0
-        previous_line = self.children[-1] if self.children else None
-        self.children.append(LineLayout(self.node, self, previous_line))
 
-    def self_rect(self) -> Rect:
-        """Return the block’s bounding rectangle for background painting."""
-        return Rect(self.x, self.y, self.x + self.width, self.y + self.height)
-
-class LineLayout:
-    def __init__(self, node, parent, previous):
-        self.node = node
-        self.parent = parent
-        self.previous = previous
-        self.children: list[object] = []
-        self.x = self.y = 0
-        self.width = self.height = 0
-
-    def layout(self):
-        # Lines span the full width of the parent block
-        self.width = self.parent.width
-        self.x = self.parent.x
-        # Stack vertically below the previous line:contentReference[oaicite:3]{index=3}
-        if self.previous:
-            self.y = self.previous.y + self.previous.height
-        else:
-            self.y = self.parent.y
-        # Lay out children (TextLayout or InputLayout)
-        for child in self.children:
-            child.layout()
-        if not self.children:
-            self.height = 0
-            return
-        # Compute baseline from maximum ascents/descents:contentReference[oaicite:4]{index=4}
-        max_ascent = max(child.font.metrics("ascent") for child in self.children)
-        max_descent = max(child.font.metrics("descent") for child in self.children)
-        baseline = self.y + max_ascent
-        for child in self.children:
-            child.y = baseline - child.font.metrics("ascent")
-        self.height = 1.25 * (max_ascent + max_descent)
-
-    def paint(self) -> list:
-        # Lines themselves draw nothing; children handle painting
-        return []
-
-    def should_paint(self) -> bool:
-        return True
-
-
-class TextLayout:
-    """A single word within a line."""
-    def __init__(self, node, word, parent, previous):
-        self.node = node
-        self.word = word
-        self.parent = parent
-        self.previous = previous
-        self.children = []
-        self.x = self.y = 0
-        self.width = self.height = 0
-        self.font = None
-
-    def layout(self):
-        # Compute the font from inherited styles
-        weight = self.node.style.get("font-weight", "normal")
-        style = self.node.style.get("font-style", "normal")
-        if style == "normal":
-            style = "roman"
-        size = int(float(self.node.style.get("font-size", "16px")[:-2]) * 0.75)
-        self.font = get_font(size, weight, style)
-        self.width = self.font.measure(self.word)
-        # Place after previous word with a space:contentReference[oaicite:5]{index=5}
-        if self.previous:
-            space = self.previous.font.measure(" ")
-            self.x = self.previous.x + self.previous.width + space
-        else:
-            self.x = self.parent.x
-        self.height = self.font.metrics("linespace")
-
-    def paint(self) -> list:
-        color = self.node.style["color"]
-        return [DrawText(self.x, self.y, self.word, self.font, color)]
-
-    def should_paint(self) -> bool:
-        return True
-
-
-class InputLayout:
-    """
-    Layout object for <input> and <button> elements.  Draws a coloured
-    rectangle and the element’s value or label:contentReference[oaicite:6]{index=6}.
-    """
-    def __init__(self, node, parent, previous):
-        self.node = node
-        self.parent = parent
-        self.previous = previous
-        self.children = []
-        self.x = self.y = 0
-        self.width = self.height = 0
-        self.font = None
-
-    def layout(self):
-        # Font for input or button
-        weight = self.node.style.get("font-weight", "normal")
-        style = self.node.style.get("font-style", "normal")
-        if style == "normal":
-            style = "roman"
-        size = int(float(self.node.style.get("font-size", "16px")[:-2]) * 0.75)
-        self.font = get_font(size, weight, style)
-        # Width: fixed for input; computed for button
-        if self.node.tag == "input":
-            self.width = INPUT_WIDTH_PX
-        else:
-            text = ""
-            if len(self.node.children) == 1 and isinstance(self.node.children[0], Text):
-                text = self.node.children[0].text
-            self.width = max(80, self.font.measure(text) + 20)
-        # Horizontal position
-        if self.previous:
-            space = self.previous.font.measure(" ")
-            self.x = self.previous.x + self.previous.width + space
-        else:
-            self.x = self.parent.x
-        # Height based on font
-        self.height = self.font.metrics("linespace")
-
-    def self_rect(self) -> Rect:
-        return Rect(self.x, self.y, self.x + self.width, self.y + self.height)
-
-    def paint(self) -> list:
-        cmds: list = []
-        # Background colour:contentReference[oaicite:7]{index=7}
-        bgcolor = self.node.style.get("background-color", "transparent")
-        if bgcolor != "transparent":
-            rect = self.self_rect()
-            cmds.append(DrawRect(rect.left, rect.top, rect.right, rect.bottom, bgcolor))
-        # Value (for <input>) or label (for <button>)
-        if self.node.tag == "input":
-            text = self.node.attributes.get("value", "")
-        else:
-            if len(self.node.children) == 1 and isinstance(self.node.children[0], Text):
-                text = self.node.children[0].text
-            else:
-                text = ""
-        cmds.append(DrawText(self.x, self.y, text, self.font, self.node.style["color"]))
-# ================= Draw commands =================
-class DrawText:
-    class Rect:
-        def __init__(self, left, top, right, bottom):
-            self.left, self.top, self.right, self.bottom = left, top, right, bottom
-        def contains_point(self, x, y):
-            return self.left <= x <= self.right and self.top <= y <= self.bottom
+# ================= Draw commands + geometry shims =================
+class Rect:
+    def __init__(self, left, top, right, bottom):
+        self.left, self.top, self.right, self.bottom = left, top, right, bottom
+    def contains_point(self, x, y):
+        return self.left <= x <= self.right and self.top <= y <= self.bottom
 
 class DrawText:
     def __init__(self, x1, y1, text, font, color):
@@ -784,6 +635,399 @@ class DrawOutline:
         canvas.create_rectangle(self.x1, self.y1 - scroll, self.x2, self.y2 - scroll,
                                 outline=self.color, width=self.thickness)
 
+# ================= JavaScript runtime & context =================
+# The following strings define a minimal DOM-like API implemented in
+# JavaScript. They expose methods used by exercises in Chapter 9
+# such as Node.children, document.createElement, appendChild,
+# insertBefore, removeChild, and event bubbling with
+# stopPropagation. The Python functions registered with DukPy
+# provide the backing functionality for these methods.
+RUNTIME_JS = """
+function Node(handle) { this.handle = handle; }
+var LISTENERS = {};
+Node.prototype.addEventListener = function(type, listener) {
+  if (!LISTENERS[this.handle]) LISTENERS[this.handle] = {};
+  var dict = LISTENERS[this.handle];
+  if (!dict[type]) dict[type] = [];
+  dict[type].push(listener);
+};
+// dispatchEvent handles event bubbling. It calls listeners on this
+// node, then recurses up the tree if the event hasn’t been stopped.
+Node.prototype.dispatchEvent = function(evt) {
+  var list = (LISTENERS[this.handle] && LISTENERS[this.handle][evt.type]) || [];
+  for (var i = 0; i < list.length; i++) {
+    list[i].call(this, evt);
+  }
+  var do_default = evt.do_default;
+  var do_bubble = evt.do_bubble;
+  if (do_bubble) {
+    var parentHandle = call_python("getParent", this.handle);
+    if (parentHandle != -1) {
+      var parent = new Node(parentHandle);
+      // propagate; merge default flags so that preventDefault anywhere
+      // stops the default
+      do_default = parent.dispatchEvent(evt) && do_default;
+    }
+  }
+  return do_default;
+};
+function Event(type) {
+  this.type = type;
+  this.do_default = true;
+  this.do_bubble = true;
+}
+Event.prototype.preventDefault = function() { this.do_default = false; };
+Event.prototype.stopPropagation = function() { this.do_bubble = false; };
+// document.querySelectorAll forwards to Python to find matching
+// elements; returns an array of Node objects.
+document = {
+  querySelectorAll: function(sel) {
+    var handles = call_python("querySelectorAll", sel.toString());
+    var out = [];
+    for (var i = 0; i < handles.length; i++) {
+      out.push(new Node(handles[i]));
+    }
+    return out;
+  }
+};
+// Create elements in the document; implemented in Python.
+document.createElement = function(tag) {
+  var h = call_python("create_element", tag.toString().toLowerCase());
+  return new Node(h);
+};
+// Expose Node.children property: immediate element children only
+Object.defineProperty(Node.prototype, "children", {
+  get: function() {
+    var handles = call_python("children", this.handle);
+    var out = [];
+    for (var i = 0; i < handles.length; i++) {
+      out.push(new Node(handles[i]));
+    }
+    return out;
+  }
+});
+// Node.innerHTML getter/setter
+Object.defineProperty(Node.prototype, "innerHTML", {
+  get: function() {
+    return call_python("innerHTML_get", this.handle);
+  },
+  set: function(value) {
+    call_python("innerHTML_set", this.handle, value.toString());
+  }
+});
+// Node.outerHTML getter
+Object.defineProperty(Node.prototype, "outerHTML", {
+  get: function() {
+    return call_python("outerHTML_get", this.handle);
+  }
+});
+// Node.id property; forwards to getAttribute/set_attribute
+Object.defineProperty(Node.prototype, "id", {
+  get: function() {
+    return call_python("getAttribute", this.handle, "id");
+  },
+  set: function(value) {
+    call_python("set_attribute", this.handle, "id", value.toString());
+  }
+});
+Node.prototype.getAttribute = function(attr) {
+  return call_python("getAttribute", this.handle, attr.toString());
+};
+Node.prototype.setAttribute = function(attr, val) {
+  call_python("set_attribute", this.handle, attr.toString(), val.toString());
+};
+// Node.appendChild inserts a child at the end of children
+Node.prototype.appendChild = function(child) {
+  call_python("append_child", this.handle, child.handle);
+  return child;
+};
+// Node.insertBefore inserts a child before the reference node
+Node.prototype.insertBefore = function(child, ref) {
+  call_python("insert_before", this.handle, child.handle, ref.handle);
+  return child;
+};
+// Node.removeChild detaches a child from this node
+Node.prototype.removeChild = function(child) {
+  call_python("remove_child", this.handle, child.handle);
+  return child;
+};
+"""
+
+# When dispatching an event from Python, we call this snippet. It
+# constructs a new Event and dispatches it on a Node, returning
+# true if the default action should run and false if it should be
+# prevented. The Python side will invert this to determine whether
+# to skip the default action.
+EVENT_DISPATCH_JS = "new Node(dukpy.handle).dispatchEvent(new Event(dukpy.type))"
+
+class JSContext:
+    """
+    A JavaScript execution context based on DukPy. It provides a
+    minimal DOM API for JavaScript code running in the browser. The
+    context maintains mappings between Python DOM nodes and numeric
+    handles used in JavaScript. It also exports several Python
+    functions to JavaScript via `call_python`.
+    """
+    def __init__(self, tab: 'Tab') -> None:
+        self.tab = tab
+        if dukpy is None:
+            raise RuntimeError("DukPy is required for JavaScript support")
+        self.interp = dukpy.JSInterpreter()
+        # Mapping between Python nodes and JS handles
+        self.node_to_handle: dict[object, int] = {}
+        self.handle_to_node: dict[int, object] = {}
+        # Export Python functions
+        self.interp.export_function("querySelectorAll", self.querySelectorAll)
+        self.interp.export_function("getAttribute", self.getAttribute)
+        self.interp.export_function("innerHTML_set", self.innerHTML_set)
+        self.interp.export_function("children", self.children)
+        self.interp.export_function("create_element", self.create_element)
+        self.interp.export_function("append_child", self.append_child)
+        self.interp.export_function("insert_before", self.insert_before)
+        self.interp.export_function("remove_child", self.remove_child)
+        self.interp.export_function("getParent", self.getParent)
+        self.interp.export_function("innerHTML_get", self.innerHTML_get)
+        self.interp.export_function("outerHTML_get", self.outerHTML_get)
+        self.interp.export_function("set_attribute", self.set_attribute)
+        # Load runtime script
+        self.interp.evaljs(RUNTIME_JS)
+        # Track id variables defined in JS
+        self.id_vars: list[str] = []
+
+    # ----- handle management -----
+    def get_handle(self, elt) -> int:
+        """Return a stable handle for a Python node, creating one if needed."""
+        if elt not in self.node_to_handle:
+            h = len(self.node_to_handle)
+            self.node_to_handle[elt] = h
+            self.handle_to_node[h] = elt
+        return self.node_to_handle[elt]
+
+    # ----- exported functions -----
+    def querySelectorAll(self, selector_text: str) -> list[int]:
+        # Return handles for all nodes matching a CSS selector.
+        try:
+            selector = CSSParser(selector_text).selector()
+        except Exception:
+            return []
+        nodes = [n for n in tree_to_list(self.tab.nodes, []) if selector.matches(n)]
+        return [self.get_handle(n) for n in nodes]
+
+    def getAttribute(self, handle: int, attr: str) -> str:
+        node = self.handle_to_node.get(handle)
+        if isinstance(node, Element):
+            return node.attributes.get(attr, "")
+        return ""
+
+    def set_attribute(self, handle: int, attr: str, value: str) -> None:
+        node = self.handle_to_node.get(handle)
+        if not isinstance(node, Element):
+            return
+        # Update attribute
+        if value is None:
+            if attr in node.attributes:
+                del node.attributes[attr]
+        else:
+            node.attributes[attr] = value
+        # Update id variables if id changed
+        if attr == "id":
+            self.update_ids()
+        # Re-style and re-render because attributes may change styling
+        # For script/link src changes, process scripts and styles
+        self.tab.process_scripts_and_styles()
+        # Recompute style rules and layout
+        self.tab.apply_styles_and_render()
+
+    def innerHTML_set(self, handle: int, s: str) -> None:
+        # Replace children of node with new HTML
+        node = self.handle_to_node.get(handle)
+        if not isinstance(node, Element):
+            return
+        # Parse the new HTML; wrap in a dummy element to parse children
+        try:
+            parsed = HTMLParser("<body>" + s + "</body>").parse()
+        except Exception:
+            return
+        new_children = parsed.children  # children under body
+        # Detach existing children
+        node.children = []
+        for c in new_children:
+            c.parent = node
+        node.children = new_children
+        # Update stylesheets and scripts; restyle and render
+        self.tab.process_scripts_and_styles()
+        self.tab.apply_styles_and_render()
+        # Update id variables
+        self.update_ids()
+
+    def innerHTML_get(self, handle: int) -> str:
+        node = self.handle_to_node.get(handle)
+        if node is None:
+            return ""
+        out = []
+        for child in getattr(node, "children", []):
+            out.append(self._serialize(child))
+        return "".join(out)
+
+    def outerHTML_get(self, handle: int) -> str:
+        node = self.handle_to_node.get(handle)
+        if node is None:
+            return ""
+        return self._serialize(node)
+
+    def _serialize(self, node) -> str:
+        # Convert a node subtree back into HTML
+        if isinstance(node, Text):
+            return node.text
+        if isinstance(node, Element):
+            attrs = []
+            for k, v in node.attributes.items():
+                if v == "":
+                    attrs.append(k)
+                else:
+                    # quote attribute values with double quotes
+                    # and escape double quotes inside
+                    val = v.replace('"', '&quot;')
+                    attrs.append(f'{k}="{val}"')
+            attr_str = (" " + " ".join(attrs)) if attrs else ""
+            # Self-closing tags
+            if node.tag in HTMLParser.SELF_CLOSING_TAGS:
+                return f"<{node.tag}{attr_str}>"
+            inner = []
+            for c in node.children:
+                inner.append(self._serialize(c))
+            inner_str = "".join(inner)
+            return f"<{node.tag}{attr_str}>" + inner_str + f"</{node.tag}>"
+        return ""
+
+    def children(self, handle: int) -> list[int]:
+        node = self.handle_to_node.get(handle)
+        out: list[int] = []
+        if isinstance(node, Element):
+            for c in node.children:
+                if isinstance(c, Element):
+                    out.append(self.get_handle(c))
+        return out
+
+    def create_element(self, tag: str) -> int:
+        # Create a detached Element. It will be inserted later.
+        new_node = Element(tag, {}, None)
+        # Default style based on inheritance (will be updated when inserted)
+        new_node.style = {k: v for k, v in INHERITED_PROPERTIES.items()}
+        return self.get_handle(new_node)
+
+    def append_child(self, parent_handle: int, child_handle: int) -> None:
+        parent = self.handle_to_node.get(parent_handle)
+        child = self.handle_to_node.get(child_handle)
+        if not (isinstance(parent, Element) and child):
+            return
+        # Detach child from old parent if present
+        if hasattr(child, "parent") and child.parent is not None:
+            try:
+                child.parent.children.remove(child)
+            except ValueError:
+                pass
+        child.parent = parent
+        parent.children.append(child)
+        # Process potential scripts/styles and restyle DOM
+        self.tab.process_scripts_and_styles()
+        self.tab.apply_styles_and_render()
+        # Update id variables
+        self.update_ids()
+
+    def insert_before(self, parent_handle: int, child_handle: int, ref_handle: int) -> None:
+        parent = self.handle_to_node.get(parent_handle)
+        child = self.handle_to_node.get(child_handle)
+        ref = self.handle_to_node.get(ref_handle)
+        if not (isinstance(parent, Element) and child and ref):
+            return
+        # Detach child from old parent if present
+        if hasattr(child, "parent") and child.parent is not None:
+            try:
+                child.parent.children.remove(child)
+            except ValueError:
+                pass
+        child.parent = parent
+        try:
+            idx = parent.children.index(ref)
+        except ValueError:
+            parent.children.append(child)
+        else:
+            parent.children.insert(idx, child)
+        # Update
+        self.tab.process_scripts_and_styles()
+        self.tab.apply_styles_and_render()
+        self.update_ids()
+
+    def remove_child(self, parent_handle: int, child_handle: int) -> None:
+        parent = self.handle_to_node.get(parent_handle)
+        child = self.handle_to_node.get(child_handle)
+        if not (isinstance(parent, Element) and child):
+            return
+        try:
+            parent.children.remove(child)
+        except ValueError:
+            return
+        child.parent = None
+        # Remove any style sheets associated with removed subtree
+        self.tab.process_scripts_and_styles()
+        self.tab.apply_styles_and_render()
+        self.update_ids()
+
+    def getParent(self, handle: int) -> int:
+        node = self.handle_to_node.get(handle)
+        if hasattr(node, "parent") and node.parent is not None:
+            return self.get_handle(node.parent)
+        return -1
+
+    # ----- high-level operations -----
+    def update_ids(self) -> None:
+        """Update global variables in the JS interpreter for element IDs."""
+        if dukpy is None:
+            return
+        # Clear previous id vars
+        for var in self.id_vars:
+            try:
+                self.interp.evaljs(f"{var} = undefined;")
+            except Exception:
+                pass
+        self.id_vars = []
+        # Recreate variables for current elements
+        nodes = tree_to_list(self.tab.nodes, []) if self.tab.nodes else []
+        for node in nodes:
+            if isinstance(node, Element) and "id" in node.attributes:
+                varname = node.attributes["id"]
+                # Only allow identifiers that start with a letter or underscore
+                if not varname or not (varname[0].isalpha() or varname[0] == "_"):
+                    continue
+                handle = self.get_handle(node)
+                try:
+                    self.interp.evaljs(f"var {varname} = new Node({handle});")
+                    self.id_vars.append(varname)
+                except Exception:
+                    continue
+
+    def run(self, code: str) -> None:
+        """Execute JavaScript code in this context."""
+        try:
+            self.interp.evaljs(code)
+        except Exception as ex:
+            # Ignore script errors to avoid crashing the browser
+            print("JS error:", ex)
+
+    def dispatch_event(self, type: str, elt) -> bool:
+        """Dispatch an event of the given type on the given element.
+        Returns True if the default action should be skipped (prevented)."""
+        handle = self.node_to_handle.get(elt)
+        if handle is None:
+            return False
+        try:
+            # Node.dispatchEvent returns true if default should run
+            do_default = self.interp.evaljs(EVENT_DISPATCH_JS, type=type, handle=handle)
+        except Exception:
+            return False
+        return not bool(do_default)
+
 def paint_tree(layout_object, display_list):
     if hasattr(layout_object, "should_paint") and not layout_object.should_paint():
         pass
@@ -806,6 +1050,10 @@ class Tab:
         self.title = "New Tab"
         self.focus = None            # focused input Element
         self.url = None              # current page URL
+        self.js = None               # JavaScript context for this tab
+        self.loaded_scripts: set[str] = set()
+        self.loaded_styles: dict[object, list] = {}
+        self.extra_style_rules: list[tuple[object, dict[str, str]]] = []
         if home_url: self.navigate(home_url)
 
     def navigate(self, url, method="GET", body=None):
@@ -848,12 +1096,27 @@ class Tab:
         self.url = url
         self.nodes = HTMLParser(body).parse()
         self.title = self._extract_title() or f"{url.host}"
-        # Style rules
-        rules = DEFAULT_STYLE_SHEET[:]
-        rules.sort(key=cascade_priority)
-        style(self.nodes, rules)
-        # Render
-        self.render()
+        # Initialize JavaScript context
+        if dukpy is not None:
+            try:
+                self.js = JSContext(self)
+            except Exception as ex:
+                print("Failed to initialize JSContext:", ex)
+                self.js = None
+        else:
+            self.js = None
+        # Reset loaded scripts/styles
+        self.loaded_scripts = set()
+        self.loaded_styles = {}
+        self.extra_style_rules = []
+        # Process scripts and styles before styling/layout
+        self.process_scripts_and_styles()
+        # Apply styles and layout
+        self.apply_styles_and_render()
+        # Update id variables for JS
+        if self.js:
+            self.js.update_ids()
+        # Update address bar and tab UI
         if self is self.browser.current_tab():
             self.browser.address.delete(0, "end")
             self.browser.address.insert(0, str(url))
@@ -902,6 +1165,16 @@ class Tab:
         self.blur()
 
         if elt is not None:
+            # Dispatch click event to JS; if prevented, return
+            if self.js:
+                try:
+                    prevent = self.js.dispatch_event("click", elt)
+                except Exception:
+                    prevent = False
+                if prevent:
+                    # JS cancelled default
+                    self.apply_styles_and_render()
+                    return
             if elt.tag == "input":
                 # checkbox click toggles; text input focuses
                 if elt.attributes.get("type","text").lower() == "checkbox":
@@ -912,13 +1185,14 @@ class Tab:
                         elt.attributes["_checked_state"] = "false"
                     else:
                         elt.attributes["_checked_state"] = "true"
-                    self.render()
+                    # Rerender after toggle
+                    self.apply_styles_and_render()
                     return
                 # text input focus & clear
                 elt.attributes["value"] = ""
                 self.focus = elt
                 elt.is_focused = True
-                self.render()
+                self.apply_styles_and_render()
                 return
             elif elt.tag == "button":
                 form = elt.parent
@@ -928,10 +1202,20 @@ class Tab:
                     self.submit_form(form)
                     return
 
-        self.render()
+        self.apply_styles_and_render()
 
     def keypress(self, char):
         if self.focus and isinstance(self.focus, Element) and self.focus.tag == "input":
+            # Dispatch keydown event; if prevented, skip default behaviour
+            prevent = False
+            if self.js:
+                try:
+                    prevent = self.js.dispatch_event("keydown", self.focus)
+                except Exception:
+                    prevent = False
+            if prevent:
+                self.apply_styles_and_render()
+                return
             if char == "\r" or char == "\n":
                 # 8-1: Enter submits enclosing form
                 form = self.focus.parent
@@ -942,9 +1226,19 @@ class Tab:
                 return
             # simple text append (backspace etc. omitted for brevity)
             self.focus.attributes["value"] = self.focus.attributes.get("value", "") + char
-            self.render()
+            self.apply_styles_and_render()
 
     def submit_form(self, form_elt):
+        # Dispatch submit event to JS; skip default if prevented
+        prevent = False
+        if self.js:
+            try:
+                prevent = self.js.dispatch_event("submit", form_elt)
+            except Exception:
+                prevent = False
+        if prevent:
+            self.apply_styles_and_render()
+            return
         # Collect inputs
         inputs = [n for n in tree_to_list(form_elt, [])
                   if isinstance(n, Element) and n.tag == "input" and "name" in n.attributes]
@@ -961,7 +1255,7 @@ class Tab:
                 parts.append(f"{name}={value}")
             else:
                 name = urllib.parse.quote(inp.attributes["name"])
-                value = urllib.parse.quote(inp.attributes.get("value",""))
+                value = urllib.parse.quote(inp.attributes.get("value","") )
                 parts.append(f"{name}={value}")
         body = "&".join(parts)
 
@@ -975,6 +1269,89 @@ class Tab:
         if self.focus:
             self.focus.is_focused = False
             self.focus = None
+
+    # -------- script/style processing --------
+    def process_scripts_and_styles(self) -> None:
+        """
+        Scan the current DOM for <script> and <link rel="stylesheet"> tags.
+        Newly added script tags are fetched and executed. For <link>
+        style sheets, rules are loaded via CSSParser. Removed
+        <link> elements have their style rules dropped. This method
+        updates self.loaded_scripts, self.loaded_styles and
+        self.extra_style_rules accordingly. It should be called
+        before styling and layout.
+        """
+        # Only do anything if we have a DOM
+        if not self.nodes:
+            return
+        # Build a new mapping of link elements to style rules
+        new_loaded_styles: dict[object, list] = {}
+        # Traverse all nodes
+        for node in tree_to_list(self.nodes, []):
+            if isinstance(node, Element):
+                # Process <script src="...">
+                if node.tag == "script" and "src" in node.attributes:
+                    src = node.attributes["src"]
+                    # Avoid executing the same script twice
+                    if src not in self.loaded_scripts and self.js:
+                        try:
+                            script_url = self.url.resolve(src)
+                            body = script_url.request()
+                            # Run script inside JSContext
+                            try:
+                                self.js.run(body)
+                            except Exception:
+                                pass
+                            self.loaded_scripts.add(src)
+                        except Exception:
+                            # Network error: ignore
+                            pass
+                # Process <link rel="stylesheet" href="...">
+                if node.tag == "link" and node.attributes.get("rel", "").casefold() == "stylesheet" and "href" in node.attributes:
+                    href = node.attributes["href"]
+                    # Fetch and parse CSS for new or changed links
+                    if node not in self.loaded_styles:
+                        try:
+                            css_url = self.url.resolve(href)
+                            css_text = css_url.request()
+                            parser = CSSParser(css_text)
+                            rules = parser.parse()
+                        except Exception:
+                            rules = []
+                        new_loaded_styles[node] = rules
+                    else:
+                        # keep existing rules if not removed
+                        new_loaded_styles[node] = self.loaded_styles[node]
+        # Update loaded_styles and compute extra_style_rules
+        self.loaded_styles = new_loaded_styles
+        extra: list[tuple[object, dict[str, str]]] = []
+        for rules in self.loaded_styles.values():
+            extra.extend(rules)
+        self.extra_style_rules = extra
+
+    def apply_styles_and_render(self) -> None:
+        """
+        Apply CSS styles to the DOM and render the page. Combines
+        DEFAULT_STYLE_SHEET with any extra style rules loaded from
+        <link> elements. After styling, lays out the document and
+        paints it.
+        """
+        if not self.nodes:
+            return
+        # Compose style rules
+        rules = DEFAULT_STYLE_SHEET + self.extra_style_rules
+        # Sort by cascade priority
+        rules.sort(key=cascade_priority)
+        # Apply styles
+        style(self.nodes, rules)
+        # Layout and paint
+        self.render()
+        # If this tab is active, redraw the browser
+        if self is self.browser.current_tab():
+            try:
+                self.browser.draw()
+            except Exception:
+                pass
 
 # ================= Chrome shim (optional) =================
 class Chrome:

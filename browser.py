@@ -1,5 +1,5 @@
 # browser_chrome_tabs_api.py
-import socket, ssl, tkinter, tkinter.font
+import socket, ssl, sys, tkinter, tkinter.font
 
 # ================= Networking =================
 class URL:
@@ -48,7 +48,6 @@ class URL:
             url = dir + "/" + url
         return URL(self.scheme + "://" + self.host + ":" + str(self.port) + url)
 
-    # --- shim to match chapter API ---
     def __str__(self):
         show_port = (
             (self.scheme == "http" and self.port != 80) or
@@ -401,7 +400,6 @@ class DrawRect:
                                 self.right, self.bottom - scroll,
                                 width=0, fill=self.color)
 
-# not used by our UI, but provided to match chapter API
 class DrawLine:
     def __init__(self, x1, y1, x2, y2, color, thickness=1):
         self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
@@ -425,9 +423,6 @@ def paint_tree(layout_object, display_list):
 
 # ================= Tab abstraction =================
 class Tab:
-    """
-    Per-tab state & navigation.
-    """
     def __init__(self, browser, home_url=None):
         self.browser = browser
         self.history = []
@@ -438,7 +433,7 @@ class Tab:
         self.scroll = 0
         self.doc_height = HEIGHT
         self.title = "New Tab"
-        if home_url: self.navigate(home_url)
+        # no navigation here; Browser.new_tab will call navigate
 
     def navigate(self, url):
         if self.history_index + 1 < len(self.history):
@@ -514,40 +509,27 @@ class Tab:
     def scrollup(self, step=SCROLL_STEP):
         self.scroll -= step; self.clamp_scroll()
 
-# ================= Chrome shim (API parity, forwards to Browser) =================
+# ================= Chrome shim (optional) =================
 class Chrome:
     def __init__(self, browser):
         self.browser = browser
-
-    # simple rectangles for tab buttons (approx—our UI uses Tk buttons)
     def tab_rect(self, i):
         x0 = 6 + i * 140
         return Rect(x0, 2, x0 + 128, 28)
-
-    def draw(self):
-        # no-op: our Browser builds a real Tk tab strip; kept for API parity
-        pass
-
+    def draw(self): pass
     def click(self, x, y):
-        # map a click to a tab index using tab_rects; then switch
         for i in range(len(self.browser.tabs)):
             r = self.tab_rect(i)
             if r.contains_point(x, y):
                 self.browser.switch_tab(i); return
-
-    def keypress(self, char):
-        # forward to Browser address bar
-        self.browser.address.insert("end", char)
-
-    def enter(self):
-        self.browser.go_address()
+    def keypress(self, char): self.browser.address.insert("end", char)
+    def enter(self): self.browser.go_address()
 
 # ================= Browser (chrome + tabs) =================
 class Browser:
     def __init__(self):
         self.window = tkinter.Tk()
 
-        # chrome shim (not strictly used, but available)
         self.chrome_ctl = Chrome(self)
 
         # --- tab strip ---
@@ -589,8 +571,37 @@ class Browser:
         self.canvas.bind("<Button-4>", self.on_wheel_linux)
         self.canvas.bind("<Button-5>", self.on_wheel_linux)
 
-        # create first tab
+        # keyboard shortcuts (Ctrl/Cmd)
+        self._bind_accels()
+
+        # create first tab (navigate after append)
         self.new_tab(URL("https://browser.engineering/chrome.html"))
+
+    # -------- accelerators --------
+    def _bind_accels(self):
+        # helper to bind both Ctrl (Windows/Linux) and Command (macOS)
+        def bind_combo(key, handler):
+            self.window.bind(f"<Control-{key}>", handler)
+            self.window.bind(f"<Command-{key}>", handler)
+
+        bind_combo("t", lambda e: self.new_tab(URL("https://example.org/")))
+        bind_combo("w", lambda e: self.close_tab(self.active_tab_index))
+        bind_combo("l", lambda e: (self.address.focus_set(), self.address.selection_range(0, "end")))
+
+        # next / previous tab
+        def next_tab(e=None):
+            if self.tabs:
+                self.switch_tab((self.active_tab_index + 1) % len(self.tabs))
+        def prev_tab(e=None):
+            if self.tabs:
+                self.switch_tab((self.active_tab_index - 1) % len(self.tabs))
+
+        # Ctrl-Tab / Ctrl-Shift-Tab (Windows/Linux)
+        self.window.bind("<Control-Tab>", lambda e: next_tab())
+        self.window.bind("<Control-Shift-Tab>", lambda e: prev_tab())
+        # Command-Option-Right/Left (mac-ish fallback)
+        self.window.bind("<Command-Right>", lambda e: next_tab())
+        self.window.bind("<Command-Left>",  lambda e: prev_tab())
 
     # -------- tabs --------
     def current_tab(self) -> Tab:
@@ -601,6 +612,8 @@ class Browser:
         self.tabs.append(tab)
         self.active_tab_index = len(self.tabs) - 1
         self.refresh_tab_strip()
+        if url:
+            tab.navigate(url)
         self.draw()
 
     def switch_tab(self, idx: int):
@@ -615,7 +628,11 @@ class Browser:
             self.draw()
 
     def close_tab(self, idx: int):
-        if len(self.tabs) <= 1:  # keep at least one
+        if len(self.tabs) <= 1:
+            try:
+                self.window.quit()
+            finally:
+                self.window.destroy()
             return
         del self.tabs[idx]
         if self.active_tab_index >= len(self.tabs):
@@ -624,13 +641,22 @@ class Browser:
         self.draw()
 
     def refresh_tab_strip(self):
+        # rebuild the tab bar with a title button + tiny close button per tab
         for w in self.tabbar.winfo_children(): w.destroy()
         for i, t in enumerate(self.tabs):
+            cell = tkinter.Frame(self.tabbar, bd=0, relief="flat", bg="#e6e6e6")
+            # title button
             title = t.title or "New Tab"
-            b = tkinter.Button(self.tabbar, text=title[:24] + ("…" if len(title) > 24 else ""),
+            title_txt = title[:24] + ("…" if len(title) > 24 else "")
+            b = tkinter.Button(cell, text=title_txt,
                                command=lambda j=i: self.switch_tab(j),
                                relief="sunken" if i == self.active_tab_index else "raised")
-            b.pack(side="left", padx=2, pady=2)
+            b.pack(side="left", padx=(2,2), pady=2)
+            # close button ×
+            xbtn = tkinter.Button(cell, text="×", width=2,
+                                  command=lambda j=i: self.close_tab(j))
+            xbtn.pack(side="left", padx=(2,4), pady=2)
+            cell.pack(side="left")
         plus = tkinter.Button(self.tabbar, text="+", width=3,
                               command=lambda: self.new_tab(URL("https://example.org/")))
         plus.pack(side="left", padx=4, pady=2)
@@ -685,7 +711,6 @@ class Browser:
 
 # ================= CLI =================
 if __name__ == "__main__":
-    import sys
     app = Browser()
     if len(sys.argv) == 2:
         app.current_tab().navigate(URL(sys.argv[1]))

@@ -340,11 +340,31 @@ class BlockLayout:
         if mode == "block":
             self.height = sum(ch.height for ch in self.children) if self.children else VSTEP
         else:
-            if self.display_list:
-                any_font = self.display_list[0][3] if self.display_list[0][0] == "text" else get_font(12,"normal","roman")
-                self.height = (self.display_list[-1][1] - self.y) + any_font.metrics("linespace")
-            else:
-                self.height = VSTEP
+            # Compute bottom Y from the last drawn primitive, regardless of shape.
+            last_y = self.y
+            for it in reversed(self.display_list):
+                # New tagged formats
+                tag = it[0] if isinstance(it, tuple) and it and isinstance(it[0], str) else None
+                if tag in ("text", "text_abs"):
+                    # ("text_abs", (x, y), word, font, color)
+                    last_y = it[1][1]
+                    break
+                elif tag in ("rect", "outline"):
+                    # ("rect"/"outline", (x1,y1,x2,y2), ...)
+                    last_y = it[1][3]
+                    break
+                elif tag == "line":
+                    # ("line", (x1,y1,x2,y2,color,th))
+                    last_y = max(it[1][1], it[1][3])
+                    break
+                # Legacy 5-tuple support: (x, y, word, font, color)
+                if tag is None and len(it) >= 2 and isinstance(it[1], (int, float)):
+                    last_y = it[1]
+                    break
+
+            default_font = get_font(12, "normal", "roman")
+            self.height = max((last_y - self.y) + default_font.metrics("linespace"), VSTEP)
+
 
     def recurse(self, node):
         if isinstance(node, Text):
@@ -773,6 +793,13 @@ class Browser:
         self.chrome.pack(fill="x")
         self.chrome_ctl.bottom = self.chrome.winfo_reqheight() + self.tabbar.winfo_reqheight()
 
+        # scrollbar state
+        self._dragging_scroll = False
+        self._drag_offset = 0
+        self.scrollbar_thumb = None
+        self._scroll_velocity = 0.0
+        self._scroll_animating = False
+
         # --- canvas ---
         self.canvas = tkinter.Canvas(self.window, width=WIDTH, height=HEIGHT,
                                      background="white", highlightthickness=0)
@@ -792,6 +819,8 @@ class Browser:
         self.canvas.bind("<Button-4>", self.on_wheel_linux)
         self.canvas.bind("<Button-5>", self.on_wheel_linux)
         self.canvas.bind("<Button-1>", self.handle_click)
+        self.canvas.bind("<B1-Motion>", self.handle_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.handle_release)
         self.window.bind("<Key>", self.handle_key)
 
         # keyboard shortcuts (Ctrl/Cmd)
@@ -876,13 +905,48 @@ class Browser:
 
     # -------- focus & events --------
     def handle_click(self, e):
-        # clicking the page: blur address-bar focus and blur tab focus first
+        # Scrollbar hit-test first
+        track_left = WIDTH - SCROLLBAR_WIDTH
+        if e.x >= track_left:
+            tab = self.current_tab()
+            if tab.doc_height > HEIGHT and self.scrollbar_thumb:
+                x1, y1, x2, y2 = self.scrollbar_thumb
+                if y1 <= e.y <= y2:
+                    # Start dragging the thumb
+                    self._dragging_scroll = True
+                    self._drag_offset = e.y - y1
+                else:
+                    # Clicked track: jump thumb (page jump)
+                    thumb_h = y2 - y1
+                    new_y = max(0, min(e.y - thumb_h // 2, HEIGHT - thumb_h))
+                    ratio = new_y / (HEIGHT - thumb_h)
+                    tab.scroll = int(ratio * (tab.doc_height - HEIGHT))
+                    self.draw()
+            return  # don’t forward to page content when clicking the track
+
+        # Existing page-click behavior
         self.address.selection_clear()
         self.address.icursor("end")
         self.chrome_ctl.blur()
-        self.current_tab().blur()  # 8-3: ensure only one caret ever
+        self.current_tab().blur()
         self.current_tab().click(e.x, e.y)
         self.draw()
+
+    def handle_drag(self, e):
+        if not self._dragging_scroll or not self.scrollbar_thumb:
+            return
+        tab = self.current_tab()
+        x1, y1, x2, y2 = self.scrollbar_thumb
+        thumb_h = y2 - y1
+        # Constrain thumb within track
+        new_y = max(0, min(e.y - self._drag_offset, HEIGHT - thumb_h))
+        ratio = new_y / (HEIGHT - thumb_h)
+        tab.scroll = int(ratio * (tab.doc_height - HEIGHT))
+        self.draw()
+
+    def handle_release(self, e):
+        self._dragging_scroll = False
+
 
     def handle_key(self, e):
         widget = self.window.focus_get()
@@ -928,10 +992,47 @@ class Browser:
         self.draw()
 
     def on_wheel(self, e):
-        self.scroll_active(-int(e.delta / 120) * 40)
+        # Normalize wheel delta to "pixels" of scroll
+        if sys.platform == "darwin":
+            # macOS gives small deltas; invert so down = positive scroll
+            step = -float(e.delta) * 4.0     # tweak 3.0–6.0 to taste
+        else:
+            # Windows typically +/-120 per notch
+            step = -int(e.delta / 120) * 40  # 40–60 feels good
+        self._enqueue_scroll(step)
 
     def on_wheel_linux(self, e):
-        self.scroll_active(-40 if e.num == 4 else +40)
+        step = -40 if e.num == 4 else +40
+        self._enqueue_scroll(step)
+
+    def _enqueue_scroll(self, step):
+        # Accumulate velocity and kick the animation loop
+        self._scroll_velocity += step
+        if not self._scroll_animating:
+            self._scroll_animating = True
+            self._scroll_tick()
+
+    def _scroll_tick(self):
+        # Apply a chunk of velocity each frame, then decay
+        # Split big velocities into multiple smaller scrollActive calls
+        v = self._scroll_velocity
+        # Nothing left? stop.
+        if abs(v) < 0.5:
+            self._scroll_velocity = 0.0
+            self._scroll_animating = False
+            return
+
+        # Apply an integer step this frame
+        step = int(v)
+        if step != 0:
+            self.scroll_active(step)
+
+        # Decay velocity for smooth easing-out
+        self._scroll_velocity = v * 0.85   # 0.80–0.92: lower = more damping
+
+        # Schedule next frame (~60fps)
+        self.window.after(16, self._scroll_tick)
+
 
     # -------- painting --------
     def draw(self):

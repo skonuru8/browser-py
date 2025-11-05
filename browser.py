@@ -1,5 +1,7 @@
 # browser_chrome_tabs_api.py
 import socket, ssl, sys, urllib.parse, tkinter, tkinter.font
+import time
+import email.utils
 
 # Optional dependency for JavaScript execution. DukPy wraps the Duktape
 # JavaScript engine. If it isn't available, interactive scripts will
@@ -8,6 +10,14 @@ try:
     import dukpy  # type: ignore
 except Exception:
     dukpy = None
+
+# ================= Cookies =================
+# COOKIE_JAR stores cookies per origin. Each origin maps to a dict
+# mapping cookie names to (value, params) tuples. The params dict
+# contains cookie attributes like 'httponly', 'expires', etc. Cookies
+# are set via Set-Cookie headers and sent back on subsequent
+# requests via the Cookie header.
+COOKIE_JAR: dict[str, dict[str, tuple[str, dict[str, str]]]] = {}
 
 # ================= Networking =================
 class URL:
@@ -22,15 +32,80 @@ class URL:
             self.host, p = self.host.split(":", 1)
             self.port = int(p)
 
-    def request(self, payload=None):
+    def origin(self) -> str:
+        """Return the origin (scheme + host + port) of this URL."""
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+    def request(self, referrer: str | None = None, payload: str | None = None, origin: str | None = None):
+        """
+        Make an HTTP request to this URL. Sends cookies from the COOKIE_JAR
+        for this origin and stores any Set-Cookie headers. Includes
+        optional Referer and Origin headers. Returns a tuple of
+        (headers, body).
+        """
+        # Connect to server
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         s.connect((self.host, self.port))
         if self.scheme == "https":
             ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(s, server_hostname=self.host)
-
+            try:
+                s = ctx.wrap_socket(s, server_hostname=self.host)
+            except ssl.SSLError:
+                # Certificate errors will propagate to caller
+                s.close()
+                raise
+        # Build request
         method = "POST" if payload is not None else "GET"
         req = f"{method} {self.path} HTTP/1.0\r\nHost: {self.host}\r\n"
+        # Referer header
+        if referrer:
+            req += f"Referer: {referrer}\r\n"
+        # Origin header
+        if origin:
+            req += f"Origin: {origin}\r\n"
+        # Cookie header
+        jar_key = self.origin()
+        cookies: list[str] = []
+        now = time.time()
+        jar = COOKIE_JAR.get(jar_key, {})
+        # Determine request method and cross-site conditions for SameSite
+        method = "POST" if payload is not None else "GET"
+        ref_origin = None
+        if referrer:
+            try:
+                ref_origin = URL(referrer).origin()
+            except Exception:
+                ref_origin = None
+        cross_site = ref_origin is not None and ref_origin != jar_key
+        # Iterate through cookies and collect those that should be sent
+        remove_names: list[str] = []
+        for name, (value, params) in jar.items():
+            # Expiration: skip and remove expired cookies
+            exp = params.get('expires')
+            if exp:
+                try:
+                    # If stored as timestamp
+                    expires_ts = float(exp) if not isinstance(exp, (str, bytes)) else float(exp)
+                except Exception:
+                    try:
+                        dt = email.utils.parsedate_to_datetime(str(exp))
+                        expires_ts = dt.timestamp()
+                    except Exception:
+                        expires_ts = None
+                if expires_ts is not None and now > expires_ts:
+                    remove_names.append(name)
+                    continue
+            # SameSite=Lax: skip on cross-site POST
+            same_site = params.get('samesite', '').lower()
+            if same_site == 'lax' and method == 'POST' and cross_site:
+                continue
+            cookies.append(f"{name}={value}")
+        # Remove expired cookies
+        for n in remove_names:
+            jar.pop(n, None)
+        if cookies:
+            req += f"Cookie: {'; '.join(cookies)}\r\n"
+        # Content headers
         if payload is not None:
             length = len(payload.encode("utf8"))
             req += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -38,21 +113,68 @@ class URL:
         req += "\r\n"
         if payload is not None:
             req += payload
-
+        # Send request
         s.send(req.encode("utf8"))
+        # Read response
         resp = s.makefile("r", encoding="utf8", newline="\r\n")
+        # Status line
         _ = resp.readline()
-        headers = {}
+        headers: dict[str, str] = {}
         while True:
             line = resp.readline()
-            if line == "\r\n": break
+            if line == "\r\n" or line == "":
+                break
+            if ":" not in line:
+                continue
             k, v = line.split(":", 1)
-            headers[k.casefold()] = v.strip()
-        assert "transfer-encoding" not in headers
-        assert "content-encoding" not in headers
+            k_lower = k.casefold()
+            v = v.strip()
+            # Collect duplicate headers (e.g., Set-Cookie)
+            if k_lower in headers and k_lower == "set-cookie":
+                headers[k_lower] += ", " + v
+            else:
+                headers[k_lower] = v
+        # No transfer-encoding or content-encoding expected
         body = resp.read()
         s.close()
-        return body
+        # Store cookies from Set-Cookie header
+        sc = headers.get("set-cookie")
+        if sc:
+            # There may be multiple cookies separated by comma
+            cookie_headers = [x.strip() for x in sc.split(",")]
+            for cookie_str in cookie_headers:
+                if not cookie_str:
+                    continue
+                parts = [p.strip() for p in cookie_str.split(";")]
+                if not parts:
+                    continue
+                name_value = parts[0]
+                if "=" not in name_value:
+                    continue
+                name, val = name_value.split("=", 1)
+                params: dict[str, str] = {}
+                for part in parts[1:]:
+                    if not part:
+                        continue
+                    if "=" in part:
+                        k_p, v_p = part.split("=", 1)
+                        key = k_p.casefold()
+                        params[key] = v_p
+                    else:
+                        key = part.casefold()
+                        params[key] = ""
+                # Convert Expires to timestamp if possible
+                if 'expires' in params:
+                    exp_val = params['expires']
+                    try:
+                        # Try to parse to timestamp
+                        dt = email.utils.parsedate_to_datetime(str(exp_val))
+                        params['expires'] = dt.timestamp()
+                    except Exception:
+                        pass
+                # Save cookie
+                COOKIE_JAR.setdefault(jar_key, {})[name] = (val, params)
+        return headers, body
 
     def resolve(self, url):
         if "://" in url: return URL(url)
@@ -495,6 +617,11 @@ class BlockLayout:
         self.cursor_x += w + font.measure(" ")
 
     def input(self, node):
+        # Determine input type; treat default as text
+        itype = node.attributes.get("type", "text").lower()
+        # Exercise 10-1: Hidden inputs do not take up space or draw anything
+        if itype == "hidden":
+            return
         # compute font used inside widget
         weight = node.style["font-weight"]
         style = node.style["font-style"]
@@ -503,7 +630,7 @@ class BlockLayout:
         font = get_font(size, weight, style)
 
         # size by type
-        is_checkbox = node.attributes.get("type","text").lower() == "checkbox"
+        is_checkbox = itype == "checkbox"
         w = CHECKBOX_SIZE if is_checkbox else (INPUT_WIDTH_PX if node.tag == "input" else max(80, font.measure(self.button_label(node)) + 20))
 
         if self.cursor_x + w > self.width:
@@ -536,8 +663,14 @@ class BlockLayout:
             if bgcolor != "transparent":
                 self.display_list.append(("rect", rect, bgcolor))
 
+            # Determine displayed text for input or button
             if node.tag == "input":
-                text = node.attributes.get("value", "")
+                raw = node.attributes.get("value", "")
+                # Password inputs show stars instead of characters
+                if itype == "password":
+                    text = "".join("•" for _ in raw)
+                else:
+                    text = raw
             else:
                 text = self.button_label(node)
             color = node.style["color"]
@@ -568,6 +701,29 @@ class BlockLayout:
         self.cursor_x = 0
         self.line = []
 
+    # Chapter 7+ API compatibility: new_line and self_rect
+    def new_line(self) -> None:
+        """
+        Start a new line of inline content. In this implementation, a new line
+        is equivalent to flushing the current line. Provided for API
+        compatibility with later chapters.
+        """
+        self.flush()
+
+    def self_rect(self) -> 'Rect':
+        """
+        Return the bounding rectangle of this block. Provided for API
+        compatibility with later chapters. Note that width and height may not
+        be set until layout is called.
+        """
+        try:
+            right = self.x + (self.width or 0)
+            bottom = self.y + (self.height or 0)
+        except Exception:
+            right = self.x
+            bottom = self.y
+        return Rect(self.x, self.y, right, bottom)
+
     def should_paint(self):
         if isinstance(self.node, Element) and self.node.tag in ["input","button"]:
             return False
@@ -592,6 +748,214 @@ class BlockLayout:
                 _, (x1,y1,x2,y2), color, th = item
                 cmds.append(DrawOutline(x1, y1, x2, y2, color, th))
         return cmds
+
+# ================= Inline layout classes (Chapter 7+ compatibility) =================
+# The following classes are provided to match the API expected after Chapter 7. In
+# this simplified browser implementation, inline words and widgets are managed
+# directly by BlockLayout using a display list. These classes are therefore
+# minimal stubs: they store child nodes and compute sizes, but do not change
+# the rendering behaviour. They ensure that the names used in the book’s
+# outlines exist so that scripts referring to them do not crash.
+
+class LineLayout:
+    """
+    Represents a single line of inline content. Each line lays out its
+    children horizontally and computes a baseline so that text aligns
+    properly. This implementation follows the Web Browser Engineering
+    reference design: it spans the full width of its parent block, stacks
+    vertically below the previous line, and positions its child layout
+    objects (TextLayout or InputLayout) accordingly.
+    """
+    def __init__(self, node, parent, previous):
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children: list[object] = []
+        self.x = 0
+        self.y = 0
+        self.width = 0
+        self.height = 0
+
+    def layout(self) -> None:
+        # Lines span the full width of the parent block
+        self.width = getattr(self.parent, 'width', WIDTH)
+        self.x = getattr(self.parent, 'x', 0)
+        # Stack vertically below the previous line
+        if self.previous:
+            self.y = self.previous.y + self.previous.height
+        else:
+            self.y = getattr(self.parent, 'y', 0)
+        # Lay out children (TextLayout or InputLayout)
+        for child in self.children:
+            child.layout()
+        if not self.children:
+            self.height = 0
+            return
+        # Compute baseline from maximum ascents/descents of children
+        max_ascent = max(child.font.metrics("ascent") for child in self.children)
+        max_descent = max(child.font.metrics("descent") for child in self.children)
+        baseline = self.y + max_ascent
+        # Position children relative to baseline
+        for child in self.children:
+            child.y = baseline - child.font.metrics("ascent")
+        # Height: leave extra space for descenders and line spacing
+        self.height = 1.25 * (max_ascent + max_descent)
+
+    def paint(self) -> list:
+        # Lines themselves draw nothing; children handle painting
+        return []
+
+    def should_paint(self) -> bool:
+        return True
+
+class TextLayout:
+    """
+    A single word within a line. It computes its font from CSS styles,
+    measures its width and height, and positions itself next to the
+    previous inline object (with a space) or at the start of the line.
+    """
+    def __init__(self, node, word, parent, previous):
+        self.node = node
+        self.word = word
+        self.parent = parent
+        self.previous = previous
+        self.children: list = []
+        self.x = 0
+        self.y = 0
+        self.width = 0
+        self.height = 0
+        self.font = None
+
+    def layout(self) -> None:
+        # Compute the font from inherited styles
+        weight = self.node.style.get("font-weight", "normal")
+        style = self.node.style.get("font-style", "normal")
+        if style == "normal":
+            style = "roman"
+        # Default font size is 16px; convert to points (approx 0.75)
+        size_str = self.node.style.get("font-size", "16px")
+        try:
+            px = float(size_str[:-2])
+        except Exception:
+            px = 16.0
+        size = int(px * 0.75)
+        self.font = get_font(size, weight, style)
+        self.width = self.font.measure(self.word)
+        # Place after previous word with a space
+        if self.previous:
+            space = self.previous.font.measure(" ")
+            self.x = self.previous.x + self.previous.width + space
+        else:
+            self.x = getattr(self.parent, 'x', 0)
+        self.height = self.font.metrics("linespace")
+
+    def paint(self) -> list:
+        color = self.node.style.get("color", "black")
+        return [DrawText(self.x, self.y, self.word, self.font, color)]
+
+    def should_paint(self) -> bool:
+        return True
+
+class InputLayout:
+    """
+    Layout object for <input> and <button> elements.  Draws a coloured
+    rectangle and the element’s value or label. This implementation
+    follows the Web Browser Engineering design and is extended to
+    support hidden inputs and password masking as described in
+    Chapter 10 exercises.
+    """
+    def __init__(self, node, parent, previous):
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children: list = []
+        self.x = 0
+        self.y = 0
+        self.width = 0
+        self.height = 0
+        self.font = None
+
+    def layout(self) -> None:
+        # Font for input or button
+        weight = self.node.style.get("font-weight", "normal")
+        style = self.node.style.get("font-style", "normal")
+        if style == "normal":
+            style = "roman"
+        size_str = self.node.style.get("font-size", "16px")
+        try:
+            px = float(size_str[:-2])
+        except Exception:
+            px = 16.0
+        size = int(px * 0.75)
+        self.font = get_font(size, weight, style)
+        # Determine the type of input (text, hidden, password, checkbox, etc.)
+        itype = self.node.attributes.get("type", "text").lower() if self.node.tag == "input" else None
+        # Width: hidden inputs have no width or height
+        if itype == "hidden":
+            self.width = 0
+            self.height = 0
+            return
+        if self.node.tag == "input":
+            # Fixed width for text inputs, password, etc.
+            self.width = INPUT_WIDTH_PX
+        else:
+            # Button width based on its label
+            text = ""
+            if len(self.node.children) == 1 and isinstance(self.node.children[0], Text):
+                text = self.node.children[0].text
+            self.width = max(80, self.font.measure(text) + 20)
+        # Horizontal position: after previous inline object with a space
+        if self.previous:
+            space = self.previous.font.measure(" ")
+            self.x = self.previous.x + self.previous.width + space
+        else:
+            self.x = getattr(self.parent, 'x', 0)
+        # Height based on font
+        self.height = self.font.metrics("linespace")
+
+    def should_paint(self) -> bool:
+        # Hidden inputs take no space and are not painted
+        if self.node.tag == "input":
+            itype = self.node.attributes.get("type", "text").lower()
+            return itype != "hidden"
+        return True
+
+    def paint(self) -> list:
+        cmds: list = []
+        # If layout hasn't been run yet, compute it
+        if self.font is None:
+            self.layout()
+        # Hidden inputs draw nothing
+        if self.node.tag == "input":
+            itype = self.node.attributes.get("type", "text").lower()
+            if itype == "hidden":
+                return cmds
+        # Draw background rectangle if specified
+        bgcolor = self.node.style.get("background-color", "transparent")
+        if bgcolor != "transparent":
+            rect = self.self_rect()
+            cmds.append(DrawRect(rect.left, rect.top, rect.right, rect.bottom, bgcolor))
+        # Determine text value to draw
+        text_value = ""
+        if self.node.tag == "input":
+            raw = self.node.attributes.get("value", "")
+            itype = self.node.attributes.get("type", "text").lower()
+            if itype == "password":
+                text_value = "".join("•" for _ in raw)
+            else:
+                text_value = raw
+        else:
+            if len(self.node.children) == 1 and isinstance(self.node.children[0], Text):
+                text_value = self.node.children[0].text
+            else:
+                text_value = ""
+        # Font and colour
+        color = self.node.style.get("color", "black")
+        cmds.append(DrawText(self.x, self.y, text_value, self.font, color))
+        return cmds
+
+    def self_rect(self) -> 'Rect':
+        return Rect(self.x, self.y, self.x + self.width, self.y + self.height)
 
 # ================= Draw commands + geometry shims =================
 class Rect:
@@ -751,6 +1115,27 @@ Node.prototype.removeChild = function(child) {
   call_python("remove_child", this.handle, child.handle);
   return child;
 };
+// Document.cookie API: forwards to Python get_cookie/set_cookie
+Object.defineProperty(document, "cookie", {
+  get: function() {
+    return call_python("get_cookie");
+  },
+  set: function(value) {
+    call_python("set_cookie", value.toString());
+  }
+});
+// Minimal XMLHttpRequest implementation (synchronous only)
+function XMLHttpRequest() {}
+XMLHttpRequest.prototype.open = function(method, url, is_async) {
+  if (is_async) throw Error("Asynchronous XHR is not supported");
+  this.method = method;
+  this.url = url;
+};
+XMLHttpRequest.prototype.send = function(body) {
+  // call the Python handler. body can be null or a string
+  this.responseText = call_python("XMLHttpRequest_send",
+      this.method, this.url.toString(), body);
+};
 """
 
 # When dispatching an event from Python, we call this snippet. It
@@ -789,6 +1174,11 @@ class JSContext:
         self.interp.export_function("innerHTML_get", self.innerHTML_get)
         self.interp.export_function("outerHTML_get", self.outerHTML_get)
         self.interp.export_function("set_attribute", self.set_attribute)
+        # Cookie API: reading/writing document.cookie
+        self.interp.export_function("get_cookie", self.get_cookie)
+        self.interp.export_function("set_cookie", self.set_cookie)
+        # XMLHttpRequest support
+        self.interp.export_function("XMLHttpRequest_send", self.XMLHttpRequest_send)
         # Load runtime script
         self.interp.evaljs(RUNTIME_JS)
         # Track id variables defined in JS
@@ -1007,10 +1397,19 @@ class JSContext:
                 except Exception:
                     continue
 
-    def run(self, code: str) -> None:
-        """Execute JavaScript code in this context."""
+    def run(self, script: str, code: str | None = None) -> None:
+        """
+        Execute JavaScript code in this context. For compatibility with the
+        book’s outline, this method accepts two parameters (script and code).
+        When both are provided, the second parameter takes precedence; when
+        only one is provided, it is treated as the code to execute. Any
+        exceptions from the JS interpreter are printed but otherwise ignored
+        to avoid crashing the browser.
+        """
+        # Determine which argument contains the actual code
+        js_code = code if code is not None else script
         try:
-            self.interp.evaljs(code)
+            self.interp.evaljs(js_code)
         except Exception as ex:
             # Ignore script errors to avoid crashing the browser
             print("JS error:", ex)
@@ -1027,6 +1426,149 @@ class JSContext:
         except Exception:
             return False
         return not bool(do_default)
+
+    # ----- XMLHttpRequest API -----
+    def XMLHttpRequest_send(self, method: str, url: str, body: str | None):
+        """
+        Handle an XMLHttpRequest from JavaScript. Supports only synchronous
+        requests. Enforces the same-origin policy and Content-Security-Policy
+        restrictions. Includes cookies and the Origin and Referer headers. On
+        cross-origin requests, returns the response only if the server sends an
+        Access-Control-Allow-Origin header matching the requesting origin or '*'.
+        Raises an exception for disallowed requests.
+        """
+        # Resolve the URL relative to the current tab's URL
+        try:
+            full_url = self.tab.url.resolve(url)
+        except Exception as ex:
+            raise Exception(f"Invalid XHR URL: {ex}")
+        # Check Content-Security-Policy
+        if not self.tab.allowed_request(full_url):
+            raise Exception("Cross-origin XHR blocked by CSP")
+        # Perform the request; include referer and origin headers
+        try:
+            ref = str(self.tab.url) if self.tab.url else None
+            origin = self.tab.url.origin() if self.tab.url else None
+            headers, out = full_url.request(referrer=ref, payload=body, origin=origin)
+        except Exception as ex:
+            # Propagate network errors to JavaScript
+            raise Exception(str(ex))
+        # Enforce same-origin policy unless CORS allows
+        req_origin = self.tab.url.origin() if self.tab.url else None
+        resp_origin = full_url.origin()
+        if req_origin is not None and resp_origin != req_origin:
+            # Look for Access-Control-Allow-Origin header
+            allow = None
+            for k, v in (headers or {}).items():
+                if k.lower() == "access-control-allow-origin":
+                    allow = v.strip()
+                    break
+            if not allow:
+                raise Exception("Cross-origin XHR request not allowed")
+            if allow != "*" and allow != req_origin:
+                raise Exception("Cross-origin XHR request not allowed")
+        return out
+
+    # ----- Cookie API for document.cookie -----
+    def get_cookie(self) -> str:
+        """
+        Return a string representation of cookies for the current tab's origin.
+        Includes cookie parameters (e.g., Expires, HttpOnly, SameSite) using the
+        same format as the Cookie header, separated by '; '. Cookies marked
+        HttpOnly are not returned to JavaScript. Expired cookies are removed.
+        """
+        try:
+            origin = self.tab.url.origin()
+        except Exception:
+            return ""
+        now = time.time()
+        cookies = []
+        jar = COOKIE_JAR.get(origin, {})
+        # Remove expired cookies and build the cookie string
+        expired = []
+        for name, (val, params) in jar.items():
+            # Skip HttpOnly cookies when reading
+            if any(k.lower() == 'httponly' for k in params):
+                continue
+            # Check expiration
+            exp = params.get('expires')
+            if exp:
+                try:
+                    # If expiration stored as timestamp
+                    if isinstance(exp, (int, float)):
+                        expires_ts = float(exp)
+                    else:
+                        # Parse RFC 1123 date string
+                        dt = email.utils.parsedate_to_datetime(str(exp))
+                        expires_ts = dt.timestamp()
+                except Exception:
+                    expires_ts = None
+                if expires_ts is not None and now > expires_ts:
+                    expired.append(name)
+                    continue
+            # Build cookie string: name=value plus parameters
+            parts = [f"{name}={val}"]
+            for k, v in params.items():
+                # Skip internal parameters that are empty for HttpOnly (already skipped)
+                if k.lower() == 'httponly':
+                    continue
+                if v == "":
+                    parts.append(k)
+                else:
+                    parts.append(f"{k}={v}")
+            cookies.append("; ".join(parts))
+        # Remove expired cookies from jar
+        for name in expired:
+            jar.pop(name, None)
+        return "; ".join(cookies)
+
+    def set_cookie(self, cookie_str: str) -> None:
+        """
+        Set a cookie for the current tab's origin. The cookie string should be
+        formatted like 'name=value; Expires=...; HttpOnly; SameSite=Lax'. The
+        HttpOnly attribute prevents modification from JavaScript. The Expires
+        attribute (RFC 1123 date) sets expiration. SameSite=Lax cookies will
+        be sent on same-site requests and cross-site GET requests but not on
+        cross-site POSTs. Secure and other attributes are stored but not used.
+        """
+        try:
+            origin = self.tab.url.origin()
+        except Exception:
+            return
+        cookie_str = str(cookie_str).strip()
+        if not cookie_str:
+            return
+        # Split on ';' to parse name=value and parameters
+        parts = [p.strip() for p in cookie_str.split(';')]
+        if not parts:
+            return
+        first = parts[0]
+        if '=' not in first:
+            return
+        name, val = first.split('=', 1)
+        params: dict[str, str] = {}
+        for part in parts[1:]:
+            if not part:
+                continue
+            if '=' in part:
+                k, v = part.split('=', 1)
+                params[k.casefold()] = v
+            else:
+                params[part.casefold()] = ""
+        # If attempting to set an HttpOnly cookie via JS, ignore
+        if any(k.lower() == 'httponly' for k in params):
+            return
+        # Parse Expires into timestamp if provided
+        exp = params.get('expires')
+        if exp:
+            try:
+                dt = email.utils.parsedate_to_datetime(str(exp))
+                params['expires'] = dt.timestamp()
+            except Exception:
+                # Leave as string if parsing fails
+                pass
+        # Store in cookie jar
+        COOKIE_JAR.setdefault(origin, {})[name] = (val, params)
 
 def paint_tree(layout_object, display_list):
     if hasattr(layout_object, "should_paint") and not layout_object.should_paint():
@@ -1054,6 +1596,12 @@ class Tab:
         self.loaded_scripts: set[str] = set()
         self.loaded_styles: dict[object, list] = {}
         self.extra_style_rules: list[tuple[object, dict[str, str]]] = []
+        self.allowed_origins: set[str] | None = None  # CSP allowed origins
+        self.referrer_policy: str | None = None
+        # Track certificate errors on last request. True if the last HTTPS
+        # connection failed due to invalid certificate. Used to draw the lock
+        # icon (or omit it) in the address bar.
+        self.cert_error: bool = False
         if home_url: self.navigate(home_url)
 
     def navigate(self, url, method="GET", body=None):
@@ -1086,14 +1634,70 @@ class Tab:
         self.load(entry["url"], payload=None)
 
     def load(self, url, payload=None):
+        # Determine referrer header per referrer policy on previous page
+        referrer = None
+        if self.history_index > 0 and self.history_index - 1 < len(self.history):
+            prev = self.history[self.history_index - 1]
+            prev_url = prev.get("url")
+            if isinstance(prev_url, URL):
+                # Check referrer policy on the previous page
+                if self.referrer_policy == "no-referrer":
+                    referrer = None
+                elif self.referrer_policy == "same-origin":
+                    if prev_url.origin() == url.origin():
+                        referrer = str(prev_url)
+                else:
+                    referrer = str(prev_url)
+        # Reset certificate error flag
+        self.cert_error = False
         try:
             self.browser.set_status("Loading…")
-            body = url.request(payload)
+            # Perform the network request, capturing headers and body
+            headers, body = url.request(referrer=referrer, payload=payload)
             self.browser.set_status("")
+        except ssl.SSLError:
+            # Certificate error
+            self.cert_error = True
+            self.browser.set_status("⚠ Certificate error")
+            # Update padlock icon after error
+            try:
+                self.browser.update_padlock()
+            except Exception:
+                pass
+            return
         except Exception as ex:
             self.browser.set_status(f"Network error: {ex}")
             return
         self.url = url
+        # Parse Content-Security-Policy for allowed origins
+        self.allowed_origins = None
+        csp = None
+        for k, v in (headers or {}).items():
+            if k.lower() == "content-security-policy":
+                csp = v
+                break
+        if csp and "default-src" in csp:
+            parts = csp.split()
+            try:
+                idx = parts.index("default-src")
+                allowed = set()
+                for item in parts[idx + 1:]:
+                    item = item.strip().rstrip(";")
+                    if item:
+                        allowed.add(item)
+                self.allowed_origins = allowed if allowed else None
+            except ValueError:
+                self.allowed_origins = None
+        else:
+            self.allowed_origins = None
+        # Parse Referrer-Policy header
+        rp = None
+        for k, v in (headers or {}).items():
+            if k.lower() == "referrer-policy":
+                rp = v
+                break
+        self.referrer_policy = rp.strip().lower() if rp else None
+        # Parse HTML document
         self.nodes = HTMLParser(body).parse()
         self.title = self._extract_title() or f"{url.host}"
         # Initialize JavaScript context
@@ -1120,6 +1724,11 @@ class Tab:
         if self is self.browser.current_tab():
             self.browser.address.delete(0, "end")
             self.browser.address.insert(0, str(url))
+            # Update padlock icon
+            try:
+                self.browser.update_padlock()
+            except Exception:
+                pass
             self.browser.draw()
             self.browser.refresh_tab_strip()
 
@@ -1228,6 +1837,21 @@ class Tab:
             self.focus.attributes["value"] = self.focus.attributes.get("value", "") + char
             self.apply_styles_and_render()
 
+    def allowed_request(self, url: 'URL') -> bool:
+        """
+        Check whether a request to the given URL is allowed under the current
+        Content-Security-Policy. If allowed_origins is None, all requests are
+        allowed. Otherwise only requests whose origin is in allowed_origins
+        are permitted.
+        """
+        if self.allowed_origins is None:
+            return True
+        try:
+            origin = url.origin()
+        except Exception:
+            return False
+        return origin in self.allowed_origins
+
     def submit_form(self, form_elt):
         # Dispatch submit event to JS; skip default if prevented
         prevent = False
@@ -1296,28 +1920,52 @@ class Tab:
                     if src not in self.loaded_scripts and self.js:
                         try:
                             script_url = self.url.resolve(src)
-                            body = script_url.request()
-                            # Run script inside JSContext
-                            try:
-                                self.js.run(body)
-                            except Exception:
-                                pass
-                            self.loaded_scripts.add(src)
                         except Exception:
-                            # Network error: ignore
-                            pass
+                            script_url = None
+                        # Skip if blocked by CSP
+                        if script_url and not self.allowed_request(script_url):
+                            # Disallowed by CSP: ignore script
+                            self.loaded_scripts.add(src)
+                        elif script_url:
+                            try:
+                                # Fetch script with referer and origin headers
+                                ref = str(self.url) if self.url else None
+                                origin = self.url.origin() if self.url else None
+                                h, body = script_url.request(referrer=ref, payload=None, origin=origin)
+                                # Execute script
+                                try:
+                                    self.js.run(body)
+                                except Exception:
+                                    pass
+                                self.loaded_scripts.add(src)
+                            except Exception:
+                                # Network error: ignore
+                                self.loaded_scripts.add(src)
+                                pass
                 # Process <link rel="stylesheet" href="...">
                 if node.tag == "link" and node.attributes.get("rel", "").casefold() == "stylesheet" and "href" in node.attributes:
                     href = node.attributes["href"]
+                    # Resolve URL; may raise
+                    try:
+                        css_url = self.url.resolve(href)
+                    except Exception:
+                        css_url = None
+                    # Check CSP: skip blocked styles
+                    if css_url and not self.allowed_request(css_url):
+                        # Do not load or parse
+                        continue
                     # Fetch and parse CSS for new or changed links
                     if node not in self.loaded_styles:
-                        try:
-                            css_url = self.url.resolve(href)
-                            css_text = css_url.request()
-                            parser = CSSParser(css_text)
-                            rules = parser.parse()
-                        except Exception:
-                            rules = []
+                        rules: list[tuple[object, dict[str, str]]] = []
+                        if css_url:
+                            try:
+                                ref = str(self.url) if self.url else None
+                                origin_header = self.url.origin() if self.url else None
+                                h, css_body = css_url.request(referrer=ref, payload=None, origin=origin_header)
+                                parser = CSSParser(css_body)
+                                rules = parser.parse()
+                            except Exception:
+                                rules = []
                         new_loaded_styles[node] = rules
                     else:
                         # keep existing rules if not removed
@@ -1410,11 +2058,16 @@ class Browser:
         self.back_btn  = tkinter.Button(self.chrome, text="◀", width=2, command=self.go_back)
         self.fwd_btn   = tkinter.Button(self.chrome, text="▶", width=2, command=self.go_forward)
         self.reload_btn= tkinter.Button(self.chrome, text="⟳", width=2, command=self.reload)
+        # Padlock label shows a lock icon on HTTPS pages without certificate errors
+        self.padlock = tkinter.Label(self.chrome, text="", width=2)
         self.address   = tkinter.Entry(self.chrome, width=60)
         self.go_btn    = tkinter.Button(self.chrome, text="Go", command=self.go_address)
+        # Pack buttons and padlock
         self.back_btn.pack(side="left")
         self.fwd_btn.pack(side="left")
         self.reload_btn.pack(side="left")
+        self.padlock.pack(side="left")
+        # Address bar grows to fill remaining space
         self.address.pack(side="left", fill="x", expand=True, padx=4)
         self.go_btn.pack(side="left")
         self.chrome.pack(fill="x")
@@ -1455,6 +2108,24 @@ class Browser:
 
         # first tab
         self.new_tab(URL("https://browser.engineering/chrome.html"))
+
+    def update_padlock(self) -> None:
+        """
+        Update the padlock icon in the address bar. Displays a lock icon (🔒)
+        if the current tab is on HTTPS and has no certificate errors;
+        otherwise clears the icon. Called after page loads and when
+        certificate errors occur.
+        """
+        try:
+            tab = self.current_tab()
+        except Exception:
+            return
+        # Only show lock if on HTTPS and no certificate error
+        if getattr(tab, 'url', None) and isinstance(tab.url, URL) and tab.url.scheme == 'https' and not getattr(tab, 'cert_error', False):
+            # ⁠ ensures padlock occupies space even when hidden
+            self.padlock.config(text="\N{lock}")
+        else:
+            self.padlock.config(text="")
 
     # -------- accelerators --------
     def _bind_accels(self):

@@ -1,7 +1,91 @@
 # browser_chrome_tabs_api.py
 import socket, ssl, sys, urllib.parse, tkinter, tkinter.font
+import threading  # for timers and task scheduling
+import ctypes  # needed for Skia/SDL pointer handling
 import time
 import email.utils
+
+# Prefer Skia/SDL if available
+try:
+    import sdl2, skia
+    SKIA_OK = True
+except Exception:
+    SKIA_OK = False
+
+# Tk rendering active? (used by get_font)
+TK_ACTIVE = True
+
+# Choose a non-deprecated default typeface for Skia fonts.
+# When SKIA_OK is True, pick a platform-appropriate family instead of
+# relying on the deprecated default font. If Skia isn't available,
+# leave this as None (and fall back to default behavior).
+_SKIA_TYPEFACE = None
+if 'skia' in globals() and SKIA_OK:
+    try:
+        import sys as _sys
+        _families = []
+        if _sys.platform == "darwin":
+            _families = ["Helvetica", "Arial", "Menlo", "Courier"]
+        elif _sys.platform.startswith("win"):
+            _families = ["Arial", "Segoe UI", "Calibri", "Courier New"]
+        else:
+            _families = ["DejaVu Sans", "Liberation Sans", "Arial"]
+        _tf = None
+        for _fam in _families:
+            try:
+                _tf = skia.Typeface.MakeFromName(_fam, skia.FontStyle.Normal())
+            except Exception:
+                _tf = None
+            if _tf:
+                break
+        if not _tf:
+            # ensure fallback to a widely available family
+            try:
+                _tf = skia.Typeface.MakeFromName("DejaVu Sans", skia.FontStyle.Normal())
+            except Exception:
+                _tf = None
+        _SKIA_TYPEFACE = _tf
+    except Exception:
+        _SKIA_TYPEFACE = None
+
+# Internal helper to construct a Skia Font with a non-deprecated typeface.
+# Always prefer _SKIA_TYPEFACE, and attempt a common fallback before
+# ultimately falling back to the deprecated default. This avoids warnings
+# about using the "Default font" in newer versions of Skia.
+def _get_skia_font(pt_size: int) -> 'skia.Font':
+    """Return a Skia Font object for the given point size.
+
+    This helper tries to use the globally selected `_SKIA_TYPEFACE`. If that
+    isn't available, it attempts to load a common typeface (e.g., DejaVu Sans)
+    appropriate for most platforms. If that also fails, it falls back to
+    passing None, which may trigger a deprecation warning but still returns
+    a functional font.
+    """
+    # Import skia lazily to avoid errors when SKIA_OK is False.
+    try:
+        import skia
+    except Exception:
+        return None  # type: ignore
+    tf = _SKIA_TYPEFACE
+    if tf is None:
+        # Try a common fallback family
+        try:
+            tf = skia.Typeface.MakeFromName("DejaVu Sans", skia.FontStyle.Normal())
+        except Exception:
+            tf = None
+    try:
+        # When tf is None, Skia will fall back to its default typeface.
+        return skia.Font(tf, pt_size)
+    except Exception:
+        # Final fallback
+        return skia.Font(None, pt_size)
+
+# Frame refresh rate constant. Used to schedule animation frames. The
+# browser will attempt to schedule a render roughly once every
+# REFRESH_RATE_SEC seconds when an animation frame is requested. This
+# corresponds to ~30 frames per second. See Chapter 12 for details.
+REFRESH_RATE_SEC: float = 0.033
+
 
 # Optional dependency for JavaScript execution. DukPy wraps the Duktape
 # JavaScript engine. If it isn't available, interactive scripts will
@@ -10,6 +94,73 @@ try:
     import dukpy  # type: ignore
 except Exception:
     dukpy = None
+
+# ----------------------- Tasks and Scheduling -----------------------
+class Task:
+    """
+    A simple task abstraction. Stores a callable and its arguments and
+    can be run at a later time. After running, it drops references to
+    assist garbage collection.
+    """
+    def __init__(self, task_code, *args):
+        self.task_code = task_code
+        self.args = args
+
+    def run(self):
+        try:
+            # Unpack arguments and invoke the callable
+            if self.task_code:
+                self.task_code(*self.args)
+        finally:
+            # Clear references
+            self.task_code = None
+            self.args = None
+
+
+class TaskRunner:
+    """
+    A simple FIFO task runner. Maintains a queue of tasks to run and
+    exposes methods to schedule and run tasks. A threading.Condition
+    guards access to the queue so that tasks can be enqueued from
+    multiple threads (e.g., timer threads) safely. The run() method
+    removes and runs one task if available.
+    """
+    def __init__(self, tab):
+        self.tab = tab
+        self.tasks = []
+        self.condition = threading.Condition()
+
+    def schedule_task(self, task: Task) -> None:
+        """Add a task to the queue in a thread-safe way."""
+        with self.condition:
+            self.tasks.append(task)
+            # Wake up any waiting threads
+            self.condition.notify_all()
+
+    def run(self) -> None:
+        """Run the next task from the queue, if there is one."""
+        task = None
+        with self.condition:
+            if self.tasks:
+                task = self.tasks.pop(0)
+        if task:
+            try:
+                task.run()
+            except Exception:
+                # Ignore exceptions from tasks to keep the event loop running
+                pass
+
+
+# JavaScript helper to run a setTimeout callback by handle. Passed to
+# interp.evaljs with dukpy.handle specifying which callback to run.
+SETTIMEOUT_JS = "__runSetTimeout(dukpy.handle)"
+
+# JavaScript helper to run an XMLHttpRequest onload callback by handle. This
+# invokes the __runXHROnload function in JS, passing the response body and
+# the request's handle. The dukpy.out parameter contains the response
+# string and dukpy.handle contains the XHR object's handle. See
+# JSContext.dispatch_xhr_onload for details.
+XHR_ONLOAD_JS = "__runXHROnload(dukpy.out, dukpy.handle)"
 
 # ================= Cookies =================
 # COOKIE_JAR stores cookies per origin. Each origin maps to a dict
@@ -457,7 +608,58 @@ DEFAULT_STYLE_SHEET = [
 
 # ================= Fonts & layout =================
 FONTS = {}
+
 def get_font(size, weight, style):
+    # Skia path: return a Tk-compatible shim (no deprecated default font)
+    try:
+        if not TK_ACTIVE:
+            import sys, skia
+            # pick a real family by OS
+            if sys.platform == "darwin":
+                families = ["Helvetica", "Arial", "Menlo", "Courier"]
+            elif sys.platform.startswith("win"):
+                families = ["Arial", "Segoe UI", "Calibri", "Courier New"]
+            else:
+                families = ["DejaVu Sans", "Liberation Sans", "Arial"]
+
+            tf = None
+            for fam in families:
+                tf = skia.Typeface.MakeFromName(fam, skia.FontStyle.Normal())
+                if tf: break
+            if not tf:
+                tf = skia.Typeface.MakeFromName("DejaVu Sans", skia.FontStyle.Normal())
+
+            class _SkiaFontShim:
+                def __init__(self, tf, size):
+                    self.size = float(size)
+                    self._font = skia.Font(tf, self.size)
+
+                def measure(self, text: str) -> float:
+                    return float(self._font.measureText(text))
+
+                # Tk-compatible:
+                #   metrics() -> dict
+                #   metrics("ascent") -> number
+                def metrics(self, key=None):
+                    m = self._font.getMetrics()
+                    ascent  = float(-m.fAscent)  # Skia ascent is negative; Tk expects +ve
+                    descent = float(m.fDescent)
+                    leading = float(getattr(m, "fLeading", 0.0))
+                    data = {
+                        "ascent": ascent,
+                        "descent": descent,
+                        "linespace": ascent + descent + leading,
+                    }
+                    if isinstance(key, str):
+                        return data.get(key)
+                    return data
+
+            return _SkiaFontShim(tf, size)
+    except NameError:
+        # TK_ACTIVE not defined yet; fall through to Tk path
+        pass
+
+    # Tk path (unchanged)
     key = (size, weight, style)
     if key not in FONTS:
         font = tkinter.font.Font(size=size, weight=weight, slant=style)
@@ -497,6 +699,18 @@ def style(node, rules):
         if selector.matches(node):
             for p, v in body.items():
                 node.style[p] = v
+
+    # Inline style parsing (chapter 11)
+    if isinstance(node, Element) and "style" in getattr(node, 'attributes', {}):
+        for decl in node.attributes.get("style",""
+                    ).split(";"):
+            if ":" in decl:
+                k,v = decl.split(":",1)
+                node.style[k.strip().casefold()] = v.strip()
+
+    # Defaults for chapter 11 visual effects
+    node.style.setdefault("background-color", "transparent")
+    node.style.setdefault("border-radius", "0px")
     if node.style["font-size"].endswith("%"):
         parent_px = float((node.parent.style["font-size"] if node.parent else INHERITED_PROPERTIES["font-size"])[:-2])
         node_pct = float(node.style["font-size"][:-1]) / 100
@@ -504,6 +718,54 @@ def style(node, rules):
     for c in node.children:
         style(c, rules)
 
+
+def _px_from_length(value: str, x1, y1, x2, y2):
+    """
+    Convert a CSS length value to pixels.
+    Supports 'px' and '%' units. For unsupported units, raises NotImplementedError.
+    """
+    try:
+        v = value.strip()
+        if v.endswith("px"):
+            return float(v[:-2])
+        elif v.endswith("%"):
+            w = abs(x2 - x1)
+            h = abs(y2 - y1)
+            return (w + h) * 0.5 * float(v[:-1]) / 100.0
+        elif v == "" or v == "0":
+            return 0.0
+        else:
+            # Try to parse as float
+            return float(v)
+    except Exception:
+        raise NotImplementedError(f"Unsupported length value: {value}")
+
+def _parse_color(c: str):
+    NAMED = {
+        "black": 0xFF000000, "white": 0xFFFFFFFF, "gray": 0xFF808080,
+        "lightblue": 0xFFADD8E6, "orange": 0xFFFFA500, "red": 0xFFFF0000,
+        "blue": 0xFF0000FF, "green": 0xFF008000, "lightgray": 0xFFD3D3D3
+    }
+    c = (c or "").strip().lower()
+    if c in NAMED: return NAMED[c]
+    if c.startswith("#"):
+        h = c[1:]
+        if len(h) == 3:
+            r = int(h[0]*2, 16); g = int(h[1]*2, 16); b = int(h[2]*2, 16)
+        else:
+            r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
+        return (0xFF<<24) | (r<<16) | (g<<8) | b
+    return 0xFF000000
+
+    try:
+        v = value.strip()
+        if v.endswith("px"): return float(v[:-2])
+        if v.endswith("%"):
+            w = abs(x2 - x1); h = abs(y2 - y1)
+            return (w + h) * 0.5 * float(v[:-1]) / 100.0
+        return float(v)
+    except Exception:
+        return 0.0
 class DocumentLayout:
     def __init__(self, node):
         self.node = node
@@ -661,7 +923,9 @@ class BlockLayout:
         else:
             bgcolor = node.style.get("background-color", "transparent")
             if bgcolor != "transparent":
-                self.display_list.append(("rect", rect, bgcolor))
+                br = node.style.get("border-radius", "0px")
+                radius = _px_from_length(br, *rect)
+                self.display_list.append(("rrect", rect, bgcolor, radius))
 
             # Determine displayed text for input or button
             if node.tag == "input":
@@ -731,6 +995,15 @@ class BlockLayout:
 
     def paint(self):
         cmds = []
+        # background for element blocks per chapter 11
+        if isinstance(self.node, Element):
+            bgcolor = self.node.style.get("background-color", "transparent")
+            if bgcolor != "transparent":
+                x1,y1 = self.x, self.y
+                x2,y2 = self.x + (self.width or 0), self.y + (self.height or 0)
+                br = self.node.style.get("border-radius", "0px")
+                radius = _px_from_length(br, x1,y1,x2,y2)
+                cmds.append(DrawRRect(x1, y1, x2, y2, bgcolor, radius))
         if isinstance(self.node, Element) and self.node.tag == "pre":
             x2, y2 = self.x + self.width, self.y + self.height
             cmds.append(DrawRect(self.x, self.y, x2, y2, "gray"))
@@ -741,6 +1014,9 @@ class BlockLayout:
             elif item[0] == "rect":
                 _, (x1,y1,x2,y2), color = item
                 cmds.append(DrawRect(x1, y1, x2, y2, color))
+            elif item[0] == "rrect":
+                _, (x1,y1,x2,y2), color, radius = item
+                cmds.append(DrawRRect(x1, y1, x2, y2, color, radius))
             elif item[0] == "line":
                 _, (x1,y1,x2,y2,color,th) = item
                 cmds.append(DrawLine(x1, y1, x2, y2, color, th))
@@ -848,6 +1124,22 @@ class TextLayout:
         else:
             self.x = getattr(self.parent, 'x', 0)
         self.height = self.font.metrics("linespace")
+
+        # If this text node is an anchor (<a href="...">), register its
+        # bounding box for click detection. The rect covers the full
+        # width and line height of the text. This enables link clicks in
+        # Skia mode when the user clicks on anchor text.
+        try:
+            if isinstance(self.node, Element) and self.node.tag == "a":
+                # Only register if the anchor has an href attribute
+                if "href" in getattr(self.node, "attributes", {}):
+                    x1 = self.x
+                    y1 = self.y
+                    x2 = self.x + self.width
+                    y2 = self.y + self.height
+                    Browser._register_widget_box(self.node, (x1, y1, x2, y2))
+        except Exception:
+            pass
 
     def paint(self) -> list:
         color = self.node.style.get("color", "black")
@@ -1124,18 +1416,109 @@ Object.defineProperty(document, "cookie", {
     call_python("set_cookie", value.toString());
   }
 });
-// Minimal XMLHttpRequest implementation (synchronous only)
-function XMLHttpRequest() {}
+// Minimal XMLHttpRequest implementation (supports sync and async)
+// Each XHR object stores a unique handle in XHR_REQUESTS so Python
+// can identify which JS object to call back into. The `open`
+// method stores the HTTP method, URL and whether the request is
+// asynchronous. The `send` method calls into Python with the extra
+// arguments `is_async` and `handle`. In the synchronous case,
+// send() returns the response body which is saved to `responseText`.
+var XHR_REQUESTS = {};
+function XMLHttpRequest() {
+  this.handle = Object.keys(XHR_REQUESTS).length;
+  XHR_REQUESTS[this.handle] = this;
+  this.is_async = false;
+  this.method = null;
+  this.url = null;
+}
 XMLHttpRequest.prototype.open = function(method, url, is_async) {
-  if (is_async) throw Error("Asynchronous XHR is not supported");
+  this.is_async = !!is_async;
   this.method = method;
   this.url = url;
 };
 XMLHttpRequest.prototype.send = function(body) {
-  // call the Python handler. body can be null or a string
-  this.responseText = call_python("XMLHttpRequest_send",
-      this.method, this.url.toString(), body);
+  // Body may be null or a string. In the async case, Python will
+  // start the request on a new thread and return immediately. In
+  // the sync case, it returns the response body, which we store.
+  var result = call_python("XMLHttpRequest_send",
+      this.method,
+      this.url.toString(),
+      body,
+      this.is_async,
+      this.handle);
+  if (!this.is_async) {
+    this.responseText = result;
+  }
 };
+// Called by Python when an async XHR completes. It finds the JS
+// XHR object by handle and calls its onload handler, if present,
+// passing in a 'load' event. It also sets responseText.
+function __runXHROnload(body, handle) {
+  var obj = XHR_REQUESTS[handle];
+  var evt = new Event('load');
+  obj.responseText = body;
+  if (obj.onload) {
+    obj.onload(evt);
+  }
+}
+
+// ---------------- Task-based timers and animation frames ----------------
+// Storage for pending setTimeout callbacks. Each entry maps a handle
+// to a callback function. The handle is just the number of callbacks
+// seen so far.
+var SET_TIMEOUT_REQUESTS = {};
+
+// setTimeout schedules a callback to run after a given number of
+// milliseconds. It stores the callback in SET_TIMEOUT_REQUESTS and
+// notifies Python to create a timer. Returns a handle, but our
+// implementation does not support clearTimeout.
+function setTimeout(callback, time_delta) {
+  var handle = Object.keys(SET_TIMEOUT_REQUESTS).length;
+  SET_TIMEOUT_REQUESTS[handle] = callback;
+  call_python("setTimeout", handle, time_delta);
+  return handle;
+}
+
+// __runSetTimeout is called by Python when a timer fires. It finds the
+// callback by handle and runs it. Note that we do not remove the
+// callback from SET_TIMEOUT_REQUESTS; this is a leak, but acceptable
+// for our toy browser.
+function __runSetTimeout(handle) {
+  var callback = SET_TIMEOUT_REQUESTS[handle];
+  if (callback) callback();
+}
+
+// Storage for requestAnimationFrame listeners. Each frame we run
+// the accumulated callbacks and reset the list. Any callbacks
+// registered during a frame are scheduled for the next frame.
+var RAF_LISTENERS = [];
+
+// requestAnimationFrame registers a function to run before the next
+// render. It stores the function and notifies Python to schedule
+// the render. Returns nothing.
+function requestAnimationFrame(fn) {
+  RAF_LISTENERS.push(fn);
+  call_python("requestAnimationFrame");
+}
+
+// __runRAFHandlers runs all listeners registered for the current
+// frame. It resets RAF_LISTENERS so that any new listeners are for
+// the next frame.
+function __runRAFHandlers() {
+  var handlers_copy = RAF_LISTENERS;
+  RAF_LISTENERS = [];
+  for (var i = 0; i < handlers_copy.length; i++) {
+    handlers_copy[i]();
+  }
+}
+
+// Node.style setter: forwards style strings to Python. Setting
+// style triggers a re-render via set_needs_render on the Python side.
+Object.defineProperty(Node.prototype, 'style', {
+  set: function(s) {
+    call_python("style_set", this.handle, s.toString());
+  }
+});
 """
 
 # When dispatching an event from Python, we call this snippet. It
@@ -1145,6 +1528,26 @@ XMLHttpRequest.prototype.send = function(body) {
 # to skip the default action.
 EVENT_DISPATCH_JS = "new Node(dukpy.handle).dispatchEvent(new Event(dukpy.type))"
 
+
+class DrawRRect:
+    def __init__(self, x1, y1, x2, y2, color, radius):
+        self.top = y1; self.left = x1
+        self.bottom = y2; self.right = x2
+        self.color = color; self.radius = max(0.0, float(radius))
+    def execute(self, scroll, canvas):
+        x1,y1,x2,y2 = self.left, self.top - scroll, self.right, self.bottom - scroll
+        r = max(0.0, min(self.radius, min((x2-x1)/2, (y2-y1)/2)))
+        if r <= 0:
+            canvas.create_rectangle(x1,y1,x2,y2, width=0, fill=self.color); return
+        # center rects
+        canvas.create_rectangle(x1+r, y1, x2-r, y2, width=0, fill=self.color)
+        canvas.create_rectangle(x1, y1+r, x1+r, y2-r, width=0, fill=self.color)
+        canvas.create_rectangle(x2-r, y1+r, x2, y2-r, width=0, fill=self.color)
+        # arcs
+        canvas.create_arc(x1, y1, x1+2*r, y1+2*r, start=90, extent=90, outline=self.color, fill=self.color)
+        canvas.create_arc(x2-2*r, y1, x2, y1+2*r, start=0,  extent=90, outline=self.color, fill=self.color)
+        canvas.create_arc(x2-2*r, y2-2*r, x2, y2, start=270, extent=90, outline=self.color, fill=self.color)
+        canvas.create_arc(x1, y2-2*r, x1+2*r, y2, start=180, extent=90, outline=self.color, fill=self.color)
 class JSContext:
     """
     A JavaScript execution context based on DukPy. It provides a
@@ -1179,6 +1582,12 @@ class JSContext:
         self.interp.export_function("set_cookie", self.set_cookie)
         # XMLHttpRequest support
         self.interp.export_function("XMLHttpRequest_send", self.XMLHttpRequest_send)
+        # Timers and animation frames support
+        self.interp.export_function("style_set", self.style_set)
+        self.interp.export_function("setTimeout", self.setTimeout)
+        self.interp.export_function("requestAnimationFrame", self.requestAnimationFrame)
+        # Whether this context has been discarded (e.g., page navigated away)
+        self.discarded = False
         # Load runtime script
         self.interp.evaljs(RUNTIME_JS)
         # Track id variables defined in JS
@@ -1414,6 +1823,7 @@ class JSContext:
             # Ignore script errors to avoid crashing the browser
             print("JS error:", ex)
 
+
     def dispatch_event(self, type: str, elt) -> bool:
         """Dispatch an event of the given type on the given element.
         Returns True if the default action should be skipped (prevented)."""
@@ -1428,14 +1838,21 @@ class JSContext:
         return not bool(do_default)
 
     # ----- XMLHttpRequest API -----
-    def XMLHttpRequest_send(self, method: str, url: str, body: str | None):
+    def XMLHttpRequest_send(self, method: str, url: str,
+                            body: str | None = None,
+                            isasync: bool = False,
+                            handle: int | None = None):
         """
-        Handle an XMLHttpRequest from JavaScript. Supports only synchronous
-        requests. Enforces the same-origin policy and Content-Security-Policy
-        restrictions. Includes cookies and the Origin and Referer headers. On
-        cross-origin requests, returns the response only if the server sends an
-        Access-Control-Allow-Origin header matching the requesting origin or '*'.
-        Raises an exception for disallowed requests.
+        Handle an XMLHttpRequest from JavaScript. Supports both synchronous
+        and asynchronous requests. The `isasync` flag controls whether the
+        request should block JavaScript execution. In the synchronous case,
+        the response body is returned directly. In the asynchronous case,
+        a Python thread performs the request and enqueues a task to call
+        __runXHROnload on the JavaScript side when the response arrives.
+
+        The `handle` identifies the XHR object on the JS side; it must
+        be passed back to __runXHROnload so that the correct object's
+        onload callback and responseText property are set.
         """
         # Resolve the URL relative to the current tab's URL
         try:
@@ -1445,29 +1862,74 @@ class JSContext:
         # Check Content-Security-Policy
         if not self.tab.allowed_request(full_url):
             raise Exception("Cross-origin XHR blocked by CSP")
-        # Perform the request; include referer and origin headers
+
+        # Helper to perform the request and schedule the JS callback
+        def run_load() -> str:
+            # Perform the request; include referer and origin headers
+            try:
+                ref = str(self.tab.url) if self.tab.url else None
+                origin = self.tab.url.origin() if self.tab.url else None
+                headers, out = full_url.request(referrer=ref, payload=body, origin=origin)
+            except Exception as ex:
+                # Propagate network errors to JavaScript by re-raising
+                raise Exception(str(ex))
+            # Enforce same-origin policy unless CORS allows
+            req_origin = self.tab.url.origin() if self.tab.url else None
+            resp_origin = full_url.origin()
+            if req_origin is not None and resp_origin != req_origin:
+                # Look for Access-Control-Allow-Origin header
+                allow = None
+                for k, v in (headers or {}).items():
+                    if k.lower() == "access-control-allow-origin":
+                        allow = v.strip()
+                        break
+                if not allow or (allow != "*" and allow != req_origin):
+                    raise Exception("Cross-origin XHR request not allowed")
+            # If this is an asynchronous XHR, schedule the onload callback
+            if isasync and handle is not None:
+                try:
+                    # Create a task to call dispatch_xhr_onload. Note that
+                    # out may be bytes or str; we ensure a str is passed.
+                    resp_str = out.decode('utf-8', errors='ignore') if isinstance(out, bytes) else out
+                    task = Task(self.dispatch_xhr_onload, resp_str, handle)
+                    self.tab.task_runner.schedule_task(task)
+                except Exception:
+                    pass
+            return out
+
+        # Synchronous requests block until the response arrives and then
+        # return the body. Asynchronous requests run in a separate
+        # thread; the result will be delivered via dispatch_xhr_onload.
         try:
-            ref = str(self.tab.url) if self.tab.url else None
-            origin = self.tab.url.origin() if self.tab.url else None
-            headers, out = full_url.request(referrer=ref, payload=body, origin=origin)
+            if not isasync:
+                return run_load()
+            else:
+                threading.Thread(target=run_load).start()
+                # Return an empty string to JS for async requests; the
+                # onload callback will set responseText when ready
+                return ""
         except Exception as ex:
-            # Propagate network errors to JavaScript
+            # Raise exceptions so that JS sees an error
             raise Exception(str(ex))
-        # Enforce same-origin policy unless CORS allows
-        req_origin = self.tab.url.origin() if self.tab.url else None
-        resp_origin = full_url.origin()
-        if req_origin is not None and resp_origin != req_origin:
-            # Look for Access-Control-Allow-Origin header
-            allow = None
-            for k, v in (headers or {}).items():
-                if k.lower() == "access-control-allow-origin":
-                    allow = v.strip()
-                    break
-            if not allow:
-                raise Exception("Cross-origin XHR request not allowed")
-            if allow != "*" and allow != req_origin:
-                raise Exception("Cross-origin XHR request not allowed")
-        return out
+
+    # ----- XHR onload dispatch -----
+    def dispatch_xhr_onload(self, body: str, handle: int) -> None:
+        """
+        Called when an asynchronous XMLHttpRequest completes. If this
+        context has not been discarded, this method invokes the
+        __runXHROnload JavaScript helper with the response body and
+        handle, which in turn calls the onload callback on the JS
+        XMLHttpRequest object. If the context has been discarded
+        (because the page navigated away), the callback is skipped.
+        """
+        # If we've navigated away, ignore callbacks from old pages
+        if getattr(self, 'discarded', False):
+            return
+        try:
+            # Evaluate the JS helper to invoke the callback
+            self.interp.evaljs(XHR_ONLOAD_JS, out=body, handle=handle)
+        except Exception:
+            pass
 
     # ----- Cookie API for document.cookie -----
     def get_cookie(self) -> str:
@@ -1570,6 +2032,75 @@ class JSContext:
         # Store in cookie jar
         COOKIE_JAR.setdefault(origin, {})[name] = (val, params)
 
+    # ----- style attribute support -----
+    def style_set(self, handle: int, s: str) -> None:
+        """
+        Set the style attribute on a node and mark the tab as needing
+        re-rendering. Called from JavaScript via call_python when
+        setting Node.style = ...
+        """
+        node = self.handle_to_node.get(handle)
+        if isinstance(node, Element):
+            # Update the style attribute (inline style)
+            node.attributes["style"] = s
+            # Notify the tab that rendering is needed
+            if hasattr(self.tab, "set_needs_render"):
+                self.tab.set_needs_render()
+
+    # ----- setTimeout support -----
+    def dispatch_settimeout(self, handle: int) -> None:
+        """
+        Called when a timer fires. Runs the JavaScript callback
+        associated with the given handle, unless this JS context has
+        been discarded (e.g., due to navigation).
+        """
+        if getattr(self, 'discarded', False):
+            return
+        try:
+            # Evaluate the callback stored in JS side
+            self.interp.evaljs(SETTIMEOUT_JS, handle=handle)
+        except Exception:
+            pass
+
+    def setTimeout(self, handle: int, time_ms: int) -> None:
+        """
+        Schedule a callback to run after time_ms milliseconds. This
+        method is called from JavaScript via call_python. The timer
+        callback will enqueue a task on the tab's task runner to run
+        the JavaScript callback. Thread-safe.
+        """
+        delay = (time_ms or 0) / 1000.0
+
+        def run_callback():
+            # Create a Task to invoke the callback in the main loop
+            task = Task(self.dispatch_settimeout, handle)
+            try:
+                self.tab.task_runner.schedule_task(task)
+            except Exception:
+                pass
+
+        try:
+            timer = threading.Timer(delay, run_callback)
+            timer.start()
+        except Exception:
+            pass
+
+    # ----- requestAnimationFrame support -----
+    def requestAnimationFrame(self) -> None:
+        """
+        Called from JavaScript via call_python when requestAnimationFrame
+        is invoked. Schedule a render task immediately on this tab's
+        task runner. When the task runs, Tab.render will update the
+        display list and then trigger the browser to draw. This
+        simplified implementation ensures animations run smoothly
+        without implementing a separate frame scheduler.
+        """
+        try:
+            task = Task(self.tab.render)
+            self.tab.task_runner.schedule_task(task)
+        except Exception:
+            pass
+
 def paint_tree(layout_object, display_list):
     if hasattr(layout_object, "should_paint") and not layout_object.should_paint():
         pass
@@ -1602,6 +2133,13 @@ class Tab:
         # connection failed due to invalid certificate. Used to draw the lock
         # icon (or omit it) in the address bar.
         self.cert_error: bool = False
+        # Initialize a task runner for this tab. Tasks are used to
+        # schedule deferred JavaScript execution (e.g., script loading,
+        # setTimeout callbacks, requestAnimationFrame) and run them
+        # during the browser's event loop.
+        self.task_runner = TaskRunner(self)
+        # Dirty flag indicating whether render needs to recompute layout
+        self.needs_render = False
         if home_url: self.navigate(home_url)
 
     def navigate(self, url, method="GET", body=None):
@@ -1627,6 +2165,28 @@ class Tab:
             entry = self.history[self.history_index]
             # 8-5: Do not re-POST on reload; reload with GET
             self.load(entry["url"], payload=None)
+
+    def set_needs_render(self) -> None:
+        """
+        Mark that this tab needs to be re-rendered. Setting this flag
+        will cause the next call to render() to recompute layout and
+        paint. Also notify the browser that it needs to redraw and
+        schedule an animation frame, since a render implies a change
+        visible on the next frame.
+        """
+        self.needs_render = True
+        # Notify the browser that the chrome/tab needs to be redrawn
+        try:
+            if hasattr(self.browser, 'set_needs_raster_and_draw'):
+                self.browser.set_needs_raster_and_draw()
+        except Exception:
+            pass
+        # Request an animation frame on the browser for this tab
+        try:
+            if hasattr(self.browser, 'set_needs_animation_frame'):
+                self.browser.set_needs_animation_frame(self)
+        except Exception:
+            pass
 
     def _restore_history_entry(self):
         entry = self.history[self.history_index]
@@ -1702,6 +2262,14 @@ class Tab:
         self.title = self._extract_title() or f"{url.host}"
         # Initialize JavaScript context
         if dukpy is not None:
+            # Discard any existing JS context so that pending timers
+            # don't call back into a context for an old page. Mark
+            # discarded = True on the old context so callbacks are ignored.
+            try:
+                if self.js:
+                    self.js.discarded = True
+            except Exception:
+                pass
             try:
                 self.js = JSContext(self)
             except Exception as ex:
@@ -1722,24 +2290,68 @@ class Tab:
             self.js.update_ids()
         # Update address bar and tab UI
         if self is self.browser.current_tab():
-            self.browser.address.delete(0, "end")
-            self.browser.address.insert(0, str(url))
-            # Update padlock icon
+            # Update the address bar safely across Tk/Skia modes
+            try:
+                self.browser.update_address(str(url))
+            except Exception:
+                pass
+            # Update padlock icon (will skip in Skia mode if label absent)
             try:
                 self.browser.update_padlock()
             except Exception:
                 pass
-            self.browser.draw()
-            self.browser.refresh_tab_strip()
+            # Trigger a redraw via the active backend
+            try:
+                self.browser.draw()
+            except Exception:
+                pass
+            # Refresh tab strip in Tk mode only (tabbar exists)
+            if hasattr(self.browser, 'tabbar'):
+                try:
+                    self.browser.refresh_tab_strip()
+                except Exception:
+                    pass
 
     def render(self):
+        """
+        Compute style, layout, and paint for this tab's DOM, producing a
+        display list. If the tab does not need rendering (needs_render
+        is False), this method returns immediately. It also runs any
+        requestAnimationFrame callbacks before rendering so that
+        animations take effect.
+        """
+        # Skip render if nothing has changed
+        if hasattr(self, 'needs_render') and not self.needs_render:
+            return
+        # Run any JavaScript requestAnimationFrame handlers before
+        # performing style/layout/paint. This lets scripts modify the
+        # DOM immediately before the frame is drawn.
+        if self.js:
+            try:
+                self.js.interp.evaljs("__runRAFHandlers()")
+            except Exception:
+                pass
+        # Clear widget hit-test boxes
         Browser._clear_widget_boxes()
+        # Layout and paint
         self.document = DocumentLayout(self.nodes)
         self.document.layout()
         self.display_list = []
         paint_tree(self.document, self.display_list)
         self.doc_height = self.document.height
+        # Clamp scroll offset to content height
         self.scroll = min(self.scroll, max(0, self.doc_height - HEIGHT))
+        # Reset dirty flag
+        self.needs_render = False
+        # After layout and painting, trigger a redraw. On the next
+        # animation frame the browser will repaint; however, to ensure
+        # that the updated display list appears promptly in both Tk and
+        # Skia modes, invoke the browser's draw method directly.
+        try:
+            if hasattr(self.browser, 'draw'):
+                self.browser.draw()
+        except Exception:
+            pass
 
     def _extract_title(self):
         def walk(n):
@@ -1767,6 +2379,12 @@ class Tab:
 
     # ---- input focus, typing, clicking ----
     def click(self, x, y):
+        # Ensure the layout and style are up to date before hit testing.
+        # Without this call, clicks may be handled using a stale layout tree.
+        try:
+            self.render()
+        except Exception:
+            pass
         doc_y = y + self.scroll
         elt = Browser._hit_widget(x, doc_y)
 
@@ -1784,13 +2402,15 @@ class Tab:
                     # JS cancelled default
                     self.apply_styles_and_render()
                     return
+            # Handle input elements: toggle checkboxes or focus text inputs
             if elt.tag == "input":
                 # checkbox click toggles; text input focuses
-                if elt.attributes.get("type","text").lower() == "checkbox":
+                if elt.attributes.get("type", "text").lower() == "checkbox":
                     # toggle internal checked state
                     if ("checked" in elt.attributes) or (elt.attributes.get("_checked_state") == "true"):
                         # uncheck
-                        if "checked" in elt.attributes: del elt.attributes["checked"]
+                        if "checked" in elt.attributes:
+                            del elt.attributes["checked"]
                         elt.attributes["_checked_state"] = "false"
                     else:
                         elt.attributes["_checked_state"] = "true"
@@ -1803,6 +2423,8 @@ class Tab:
                 elt.is_focused = True
                 self.apply_styles_and_render()
                 return
+
+            # Handle buttons: find containing form and submit it
             elif elt.tag == "button":
                 form = elt.parent
                 while form and not (isinstance(form, Element) and form.tag == "form"):
@@ -1811,6 +2433,19 @@ class Tab:
                     self.submit_form(form)
                     return
 
+            # Handle anchor (<a>) clicks by navigating to the href
+            elif elt.tag == "a":
+                try:
+                    href = elt.attributes.get("href")
+                    if href:
+                        # Resolve the href relative to the current page URL
+                        dest = self.url.resolve(href)
+                        self.load(dest)
+                        return
+                except Exception:
+                    pass
+
+        # Fall back: re-render the page when clicking non-interactive areas
         self.apply_styles_and_render()
 
     def keypress(self, char):
@@ -1932,11 +2567,16 @@ class Tab:
                                 ref = str(self.url) if self.url else None
                                 origin = self.url.origin() if self.url else None
                                 h, body = script_url.request(referrer=ref, payload=None, origin=origin)
-                                # Execute script
+                                # Instead of running the script immediately,
+                                # schedule a task to run it later. This keeps
+                                # the UI responsive and defers script
+                                # execution until after loading completes.
                                 try:
-                                    self.js.run(body)
+                                    task = Task(self.js.run, body)
+                                    self.task_runner.schedule_task(task)
                                 except Exception:
                                     pass
+                                # Mark this script as loaded to avoid reloading
                                 self.loaded_scripts.add(src)
                             except Exception:
                                 # Network error: ignore
@@ -2026,8 +2666,316 @@ class Chrome:
     def blur(self):
         self.focus = None
 
-# ================= Browser (chrome + tabs) =================
+class SkiaCanvasAdapter:
+    """Adapter exposing Tk-like canvas calls over a Skia canvas"""
+    def __init__(self, canvas, y_offset=0):
+        self.canvas = canvas
+        self.y_offset = y_offset
+
+    def create_rectangle(self, x1, y1, x2, y2, width=0, fill=None, outline=None):
+        paint = skia.Paint(AntiAlias=True)
+        if fill and fill != "":
+            paint.setColor(_parse_color(fill))
+            paint.setStyle(skia.Paint.kFill_Style)
+            self.canvas.drawRect(skia.Rect.MakeLTRB(x1, y1 + self.y_offset, x2, y2 + self.y_offset), paint)
+        if outline and outline != "":
+            paint = skia.Paint(AntiAlias=True)
+            paint.setColor(_parse_color(outline))
+            paint.setStyle(skia.Paint.kStroke_Style)
+            paint.setStrokeWidth(max(1, width or 1))
+            self.canvas.drawRect(skia.Rect.MakeLTRB(x1, y1 + self.y_offset, x2, y2 + self.y_offset), paint)
+
+    def create_line(self, x1, y1, x2, y2, fill=None, width=1):
+        paint = skia.Paint(AntiAlias=True)
+        if fill: paint.setColor(_parse_color(fill))
+        paint.setStrokeWidth(max(1, width))
+        self.canvas.drawLine(x1, y1 + self.y_offset, x2, y2 + self.y_offset, paint)
+
+    def create_text(self, x, y, text, fill=None, anchor="nw", font=None):
+        # font from Tk not usable; use skia default with approx size
+        size = 14
+        try:
+            if isinstance(font, tuple) and len(font)>=2 and isinstance(font[1], int):
+                size = font[1]
+        except Exception:
+            pass
+        # Use our helper to avoid deprecated default fonts
+        sk_font = _get_skia_font(size)
+        paint = skia.Paint(AntiAlias=True)
+        if fill:
+            paint.setColor(_parse_color(fill))
+        # Tk "nw" anchor: draw at (x,y)
+        self.canvas.drawString(text, x, y + self.y_offset, sk_font, paint)
+
+    def create_arc(self, x1, y1, x2, y2, start=0, extent=90, outline=None, fill=None):
+        # approximate Tk pies with path arcs
+        rect = skia.Rect.MakeLTRB(x1, y1 + self.y_offset, x2, y2 + self.y_offset)
+        # Skia angles are in degrees, use drawArc for outline; fill pie via path
+        if fill:
+            path = skia.Path()
+            cx = (x1 + x2)/2; cy = (y1 + y2)/2 + self.y_offset
+            path.moveTo(cx, cy)
+            path.arcTo(rect, start, extent, False)
+            path.close()
+            self.canvas.drawPath(path, skia.Paint(Color=_parse_color(fill), AntiAlias=True))
+        if outline:
+            paint = skia.Paint(Color=_parse_color(outline), Style=skia.Paint.kStroke_Style, AntiAlias=True)
+            self.canvas.drawArc(rect, start, extent, False, paint)
+
+class SkiaRenderer:
+    def __init__(self, browser):
+        self.browser = browser
+        # Initialize SDL for both video and events. Using SDL_INIT_VIDEO ensures
+        # that window creation functions work properly; SDL_INIT_EVENTS alone
+        # may be insufficient on some platforms.
+        sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO | sdl2.SDL_INIT_EVENTS)
+        flags = sdl2.SDL_WINDOW_SHOWN | sdl2.SDL_WINDOW_ALLOW_HIGHDPI
+        self.window = sdl2.SDL_CreateWindow(b"WBE Browser (Skia)",
+            sdl2.SDL_WINDOWPOS_CENTERED, sdl2.SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, flags)
+        self.chrome_h = 44
+        self.surface_root = skia.Surface(WIDTH, HEIGHT)
+        self.surface_tab = skia.Surface(WIDTH, HEIGHT)   # big enough; clip+translate when drawing
+        self.addr_text = ""
+        self.btn_back = (8, 8, 36, 36)
+        self.btn_fwd = (40, 8, 68, 36)
+        self.btn_reload = (72, 8, 100, 36)
+        self.addr_rect = (108, 10, WIDTH - 12, 34)
+        self.sdl_surface = sdl2.SDL_GetWindowSurface(self.window)
+
+        # Store HTTPS secure state for padlock display
+        self._secure = False
+
+    def draw_frame(self):
+        # clear root
+        rootc = self.surface_root.getCanvas()
+        rootc.clear(skia.ColorWHITE)
+
+        # draw chrome
+        rootc.drawRect(skia.Rect.MakeLTRB(0, 0, WIDTH, self.chrome_h),
+                       skia.Paint(Color=_parse_color("#f1f5f9")))
+        self._draw_button(rootc, self.btn_back, "←")
+        self._draw_button(rootc, self.btn_fwd, "→")
+        self._draw_button(rootc, self.btn_reload, "⟳")
+        self._draw_address(rootc, self.addr_rect, self.addr_text)
+
+        # Draw padlock icon when the current page is secure (HTTPS with no certificate errors)
+        try:
+            if getattr(self, '_secure', False):
+                # Use a non-deprecated font for the lock glyph
+                pad_font = _get_skia_font(14)
+                # Draw the lock just to the left of the address bar
+                px = self.addr_rect[0] - 20
+                py = self.addr_rect[1] + 14
+                rootc.drawString("\N{lock}", px, py, pad_font,
+                                  skia.Paint(Color=_parse_color("#111111")))
+        except Exception:
+            # If anything goes wrong (e.g., typeface unavailable), ignore
+            pass
+
+        # draw tab contents on tab surface
+        tabc = self.surface_tab.getCanvas()
+        tabc.clear(skia.ColorWHITE)
+
+        # Let browser build its display list (same as Tk path) and execute on a SkiaCanvasAdapter
+        # Clear previously registered widget boxes so hit-testing only uses
+        # elements from the current frame
+        try:
+            Browser._clear_widget_boxes()
+        except Exception:
+            pass
+        cmds = self.browser.build_display_list()
+        adapter = SkiaCanvasAdapter(tabc, y_offset=-self.browser.active_tab.scroll + self.chrome_h)
+        for cmd in cmds:
+            try:
+                cmd.execute(0, adapter)  # scroll already encoded in adapter
+            except Exception:
+                pass
+
+        # composite: draw tab surface into root clipped under chrome
+        rootc.save()
+        rootc.clipRect(skia.Rect.MakeLTRB(0, self.chrome_h, WIDTH, HEIGHT))
+        self.surface_tab.draw(rootc, 0, 0)
+        rootc.restore()
+
+        # present to window
+        self._present()
+
+        rnd = getattr(self.browser, "renderer", None)
+        if rnd is not None and hasattr(rnd, "update_address_bar"):
+            try: rnd.update_address_bar()
+            except Exception: pass
+
+        # Optional status bar (bottom-left)
+        try:
+            txt = getattr(self, "status_text", "")
+            if txt:
+                rootc = self.surface_root.getCanvas()
+                font = _get_skia_font(12)
+                paint_bg = skia.Paint(Color=_parse_color("#222222"))
+                paint_fg = skia.Paint(Color=_parse_color("#ffffff"))
+                # simple strip
+                rootc.drawRect(skia.Rect.MakeLTRB(0, HEIGHT-20, WIDTH, HEIGHT), paint_bg)
+                rootc.drawString(txt, 8, HEIGHT-6, font, paint_fg)
+        except Exception:
+            pass
+
+    def _present(self):
+        """
+        Present the current Skia frame onto the SDL surface backing our window.
+
+        This copies pixels from the Skia root surface into the SDL surface memory
+        using Image.readPixels and the buffer protocol. Using readPixels avoids
+        the need to construct a Pixmap with a ctypes pointer, which can cause
+        "Buffer does not have dimensions" errors on some versions of skia‑python.
+        """
+        # Lock the SDL surface for direct pixel access
+        sdl2.SDL_LockSurface(self.sdl_surface)
+        try:
+            # On some platforms SDL_GetWindowSurface returns a pointer to a
+            # structure; on others it returns the structure directly. Handle both.
+            sf = self.sdl_surface.contents
+        except AttributeError:
+            sf = self.sdl_surface
+
+        # Create a Skia ImageInfo describing the SDL surface
+        info = skia.ImageInfo.Make(sf.w, sf.h,
+                                   skia.ColorType.kRGBA_8888_ColorType,
+                                   skia.AlphaType.kPremul_AlphaType)
+        # Gather pixel buffer information from SDL
+        height = getattr(sf, 'h', 0)
+        row_bytes = getattr(sf, 'pitch', 0)
+        pixels_ptr = getattr(sf, 'pixels', None)
+
+        if pixels_ptr and height and row_bytes:
+            # Compute the total size of the pixel buffer
+            size = row_bytes * height
+            # Construct a ctypes array that points into the SDL surface memory
+            buf_type = ctypes.c_ubyte * size
+            buf = buf_type.from_address(pixels_ptr)
+            # Wrap in a memoryview so skia can treat it as a Python buffer
+            mv = memoryview(buf)
+            # Take a snapshot of the current Skia surface
+            img = self.surface_root.makeImageSnapshot()
+            # Copy pixels into the SDL buffer. We ignore the return value,
+            # as it may return False if readPixels fails.
+            try:
+                img.readPixels(info, mv, row_bytes)
+            except Exception:
+                # If readPixels raises, silently ignore; we'll still unlock surface
+                pass
+
+        # Unlock the surface and update the window
+        sdl2.SDL_UnlockSurface(self.sdl_surface)
+        sdl2.SDL_UpdateWindowSurface(self.window)
+
+    def _in(self, x, y, r): x1,y1,x2,y2 = r; return x1 <= x <= x2 and y1 <= y <= y2
+
+    def _draw_button(self, canvas, rect, label):
+        x1,y1,x2,y2 = rect
+        rr = skia.RRect.MakeRectXY(skia.Rect.MakeLTRB(x1,y1,x2,y2), 6,6)
+        canvas.drawRRect(rr, skia.Paint(Color=_parse_color("#e5e7eb")))
+        # Use non-deprecated font for button label
+        # Use helper to avoid deprecated default font
+        fnt = _get_skia_font(16)
+        canvas.drawString(label, x1+10, y1+12, fnt, skia.Paint(Color=_parse_color("#111111")))
+
+    def _draw_address(self, canvas, rect, text):
+        x1,y1,x2,y2 = rect
+        rr = skia.RRect.MakeRectXY(skia.Rect.MakeLTRB(x1,y1,x2,y2), 8,8)
+        canvas.drawRRect(rr, skia.Paint(Color=_parse_color("#ffffff")))
+        # Use helper to avoid deprecated default font for address text
+        fnt = _get_skia_font(14)
+        canvas.drawString(text, x1+10, y1+14, fnt, skia.Paint(Color=_parse_color("#111111")))
+
+    def mainloop(self):
+        event = sdl2.SDL_Event()
+        sdl2.SDL_StartTextInput()
+        # set initial address
+        if self.browser.active_tab and self.browser.active_tab.url:
+            self.addr_text = str(self.browser.active_tab.url)
+        while True:
+            while sdl2.SDL_PollEvent(ctypes.byref(event)) != 0:
+                if event.type == sdl2.SDL_QUIT:
+                    self._quit()
+                elif event.type == sdl2.SDL_MOUSEBUTTONUP:
+                    x, y = event.button.x, event.button.y
+                    if y <= self.chrome_h:
+                        if self._in(x,y,self.btn_back): self.browser.back()
+                        elif self._in(x,y,self.btn_fwd): self.browser.forward()
+                        elif self._in(x,y,self.btn_reload): self.browser.reload()
+                        elif self._in(x,y,self.addr_rect): pass  # focus not tracked
+                    else:
+                        self.browser.active_tab.click(x, y - self.chrome_h + self.browser.active_tab.scroll)
+                elif event.type == sdl2.SDL_KEYDOWN:
+                    sym = event.key.keysym.sym
+                    if sym == sdl2.SDLK_RETURN:
+                        url = self.addr_text.strip()
+                        if url and not url.startswith("http"):
+                            url = "https://" + url
+                        if url:
+                            try:
+                                # Load the new URL into the active tab (this also
+                                # updates the address bar via update_address)
+                                self.browser.active_tab.load(URL(url))
+                            except Exception:
+                                pass
+                            # Ensure the address bar text matches the URL
+                            try:
+                                self.browser.update_address(url)
+                            except Exception:
+                                pass
+                    elif sym == sdl2.SDLK_BACKSPACE:
+                        self.addr_text = self.addr_text[:-1]
+                    elif sym == sdl2.SDLK_DOWN:
+                        self.browser.active_tab.scrolldown()
+                    elif sym == sdl2.SDLK_UP:
+                        self.browser.active_tab.scrollup()
+                elif event.type == sdl2.SDL_TEXTINPUT:
+                    self.addr_text += event.text.text.decode('utf8')
+            # Run one pending task for the active tab before drawing
+            try:
+                tab = self.browser.active_tab
+                if hasattr(tab, 'task_runner'):
+                    tab.task_runner.run()
+            except Exception:
+                pass
+            self.draw_frame()
+            sdl2.SDL_Delay(10)
+
+    def _quit(self):
+        if self.window: sdl2.SDL_DestroyWindow(self.window)
+        sdl2.SDL_Quit()
+        sys.exit(0)
+
+    def update_address_bar(self):
+        if self.browser.active_tab and self.browser.active_tab.url:
+            self.addr_text = str(self.browser.active_tab.url) 
+
+    # Allow Browser to store HTTPS secure state
+    def set_padlock(self, secure: bool):
+        self._secure = bool(secure)
+
+    def set_status(self, msg):
+        # Option A: just store it and draw at bottom in draw_frame()
+        self.status_text = msg
+
 class Browser:
+
+    def build_display_list(self):
+        """Collect display commands from the layout tree (Draw* objects)."""
+        cmds = []
+        if self.active_tab and getattr(self.active_tab, "document", None):
+            def collect(layout):
+                if hasattr(layout, "should_paint") and layout.should_paint():
+                    cmds.extend(layout.paint())
+                for c in getattr(layout, "children", []): collect(c)
+            collect(self.active_tab.document)
+        return cmds
+
+    def draw_for_renderer(self, renderer):
+        """Used by non-Tk renderers to trigger a paint without Tk canvas assumptions."""
+        if hasattr(renderer, "draw_frame"):
+            renderer.draw_frame()
     _widget_boxes = []  # (rect, element)
     @classmethod
     def _register_widget_box(cls, element, rect_tuple):
@@ -2044,6 +2992,40 @@ class Browser:
         return None
 
     def __init__(self):
+        # Flags used for task scheduling and rendering cadence. See Chapter 12.
+        # If True, the next call to raster_and_draw() should repaint the
+        # browser's chrome and active tab. Tabs set this flag when their
+        # display list changes (e.g., after a render).
+        self.needs_raster_and_draw: bool = False
+        # Indicates whether an animation frame task should be scheduled. When a
+        # web page calls requestAnimationFrame or when a tab marks itself as
+        # needing render, this flag is set. The browser uses it to avoid
+        # scheduling multiple render tasks in a row.
+        self.needs_animation_frame: bool = True
+        # Handle to an in-flight timer that schedules the next animation frame.
+        self.animation_timer = None
+        # --- choose renderer early (GPU preferred) ---
+        global TK_ACTIVE
+        use_skia = False
+        try:
+            use_skia = bool(SKIA_OK)
+        except Exception:
+            use_skia = False
+
+        if use_skia:
+            TK_ACTIVE = False
+            # No Tk windows at all in Skia mode
+            self.renderer = SkiaRenderer(self)
+            # Minimal core state consistent with the rest of your code
+            self.tabs = []
+            self.active_tab_index = 0
+            self.active_tab = Tab(self)
+            self.tabs.append(self.active_tab)
+            self._status_text = ""   # allow set_status in Skia mode
+            return  # IMPORTANT: skip the Tk UI setup below
+
+        # --- Tk fallback path (unchanged from your code) ---
+        TK_ACTIVE = True
         self.window = tkinter.Tk()
         self.chrome_ctl = Chrome(self)
 
@@ -2053,36 +3035,32 @@ class Browser:
         self.tabs = []
         self.active_tab_index = 0
 
+        self.scrollbar_thumb = None
+        self._dragging_scroll = False
+        self._drag_offset = 0
+        self._scroll_velocity = 0.0
+        self._scroll_animating = False
+        self._status_text = ""
+
         # --- chrome bar ---
         self.chrome = tkinter.Frame(self.window)
         self.back_btn  = tkinter.Button(self.chrome, text="◀", width=2, command=self.go_back)
         self.fwd_btn   = tkinter.Button(self.chrome, text="▶", width=2, command=self.go_forward)
         self.reload_btn= tkinter.Button(self.chrome, text="⟳", width=2, command=self.reload)
-        # Padlock label shows a lock icon on HTTPS pages without certificate errors
         self.padlock = tkinter.Label(self.chrome, text="", width=2)
         self.address   = tkinter.Entry(self.chrome, width=60)
+        self.address.configure(bg="white", fg="black", insertbackground="black", highlightthickness=0)  # readable
         self.go_btn    = tkinter.Button(self.chrome, text="Go", command=self.go_address)
-        # Pack buttons and padlock
-        self.back_btn.pack(side="left")
-        self.fwd_btn.pack(side="left")
-        self.reload_btn.pack(side="left")
+        self.back_btn.pack(side="left"); self.fwd_btn.pack(side="left"); self.reload_btn.pack(side="left")
         self.padlock.pack(side="left")
-        # Address bar grows to fill remaining space
         self.address.pack(side="left", fill="x", expand=True, padx=4)
         self.go_btn.pack(side="left")
         self.chrome.pack(fill="x")
         self.chrome_ctl.bottom = self.chrome.winfo_reqheight() + self.tabbar.winfo_reqheight()
 
-        # scrollbar state
-        self._dragging_scroll = False
-        self._drag_offset = 0
-        self.scrollbar_thumb = None
-        self._scroll_velocity = 0.0
-        self._scroll_animating = False
-
         # --- canvas ---
         self.canvas = tkinter.Canvas(self.window, width=WIDTH, height=HEIGHT,
-                                     background="white", highlightthickness=0)
+                                    background="white", highlightthickness=0)
         self.canvas.pack()
 
         # --- status ---
@@ -2103,10 +3081,9 @@ class Browser:
         self.canvas.bind("<ButtonRelease-1>", self.handle_release)
         self.window.bind("<Key>", self.handle_key)
 
-        # keyboard shortcuts (Ctrl/Cmd)
         self._bind_accels()
 
-        # first tab
+        # first tab (Tk path)
         self.new_tab(URL("https://browser.engineering/chrome.html"))
 
     def update_padlock(self) -> None:
@@ -2120,12 +3097,27 @@ class Browser:
             tab = self.current_tab()
         except Exception:
             return
-        # Only show lock if on HTTPS and no certificate error
-        if getattr(tab, 'url', None) and isinstance(tab.url, URL) and tab.url.scheme == 'https' and not getattr(tab, 'cert_error', False):
-            # ⁠ ensures padlock occupies space even when hidden
-            self.padlock.config(text="\N{lock}")
-        else:
-            self.padlock.config(text="")
+        # Determine if a padlock should be displayed
+        secure = False
+        url = getattr(tab, 'url', None)
+        if isinstance(url, URL):
+            secure = (url.scheme == 'https' and not getattr(tab, 'cert_error', False))
+
+        # Update Tk padlock label if present
+        pad = getattr(self, 'padlock', None)
+        if pad is not None:
+            try:
+                pad.config(text=("\N{lock}" if secure else ""))
+            except Exception:
+                pass
+
+        # In the Skia renderer, optionally store secure state for drawing
+        rnd = getattr(self, 'renderer', None)
+        if rnd is not None and hasattr(rnd, 'set_padlock'):
+            try:
+                rnd.set_padlock(secure)
+            except Exception:
+                pass
 
     # -------- accelerators --------
     def _bind_accels(self):
@@ -2154,9 +3146,12 @@ class Browser:
         tab = Tab(self)
         self.tabs.append(tab)
         self.active_tab_index = len(self.tabs) - 1
-        self.refresh_tab_strip()
+        # Only refresh tab strip in Tk mode
+        if hasattr(self, 'tabbar'):
+            self.refresh_tab_strip()
         if url:
             tab.navigate(url)
+        # Redraw page via active renderer
         self.draw()
 
     def switch_tab(self, idx: int):
@@ -2165,9 +3160,18 @@ class Browser:
             tab = self.current_tab()
             if 0 <= tab.history_index < len(tab.history):
                 url = tab.history[tab.history_index]["url"]
-                self.address.delete(0, "end")
-                self.address.insert(0, str(url))
-            self.refresh_tab_strip()
+                try:
+                    # Display the URL string across Tk/Skia modes
+                    self.update_address(str(url))
+                except Exception:
+                    pass
+            # Refresh tab strip only in Tk mode
+            if hasattr(self, 'tabbar'):
+                try:
+                    self.refresh_tab_strip()
+                except Exception:
+                    pass
+            # Redraw page via active renderer
             self.draw()
 
     def close_tab(self, idx: int):
@@ -2180,13 +3184,26 @@ class Browser:
         del self.tabs[idx]
         if self.active_tab_index >= len(self.tabs):
             self.active_tab_index = len(self.tabs) - 1
-        self.refresh_tab_strip()
+        # Refresh tab strip only in Tk mode
+        if hasattr(self, 'tabbar'):
+            try:
+                self.refresh_tab_strip()
+            except Exception:
+                pass
+        # Redraw page via active renderer
         self.draw()
 
     def refresh_tab_strip(self):
-        for w in self.tabbar.winfo_children(): w.destroy()
+        # Skip tab strip refresh in Skia mode (no tabbar)
+        tabbar = getattr(self, 'tabbar', None)
+        if tabbar is None:
+            return
+        # Clear existing tab buttons
+        for w in tabbar.winfo_children():
+            w.destroy()
+        # Recreate tab buttons
         for i, t in enumerate(self.tabs):
-            cell = tkinter.Frame(self.tabbar, bd=0, relief="flat", bg="#e6e6e6")
+            cell = tkinter.Frame(tabbar, bd=0, relief="flat", bg="#e6e6e6")
             title = t.title or "New Tab"
             title_txt = title[:24] + ("…" if len(title) > 24 else "")
             b = tkinter.Button(cell, text=title_txt,
@@ -2197,7 +3214,7 @@ class Browser:
                                   command=lambda j=i: self.close_tab(j))
             xbtn.pack(side="left", padx=(2,4), pady=2)
             cell.pack(side="left")
-        plus = tkinter.Button(self.tabbar, text="+", width=3,
+        plus = tkinter.Button(tabbar, text="+", width=3,
                               command=lambda: self.new_tab(URL("https://example.org/")))
         plus.pack(side="left", padx=4, pady=2)
 
@@ -2267,7 +3284,50 @@ class Browser:
             pass
 
     # -------- chrome actions --------
-    def set_status(self, msg): self.status.config(text=msg)
+    # Store status even when Tk widgets don't exist (Skia mode)
+    def set_status(self, msg):
+        # always keep the latest message
+        self._status_text = msg
+
+        # Update Tk label if present
+        lbl = getattr(self, "status", None)
+        if lbl is not None:
+            try:
+                lbl.config(text=msg)
+            except Exception:
+                pass
+
+        # Notify Skia renderer if present
+        r = getattr(self, "renderer", None)
+        if r is not None and hasattr(r, "set_status"):
+            try:
+                r.set_status(msg)
+            except Exception:
+                pass
+
+    def update_address(self, url_str: str) -> None:
+        """
+        Safely update the address bar across both Tk and Skia modes.
+
+        :param url_str: The string to display in the address bar.
+        """
+        # Update Tk Entry if present
+        addr = getattr(self, 'address', None)
+        if addr is not None:
+            try:
+                addr.delete(0, 'end')
+                addr.insert(0, url_str)
+            except Exception:
+                pass
+        # Update Skia address bar text directly
+        rnd = getattr(self, 'renderer', None)
+        if rnd is not None:
+            try:
+                # Set the text; renderer will use this on next draw_frame
+                rnd.addr_text = url_str
+            except Exception:
+                pass
+
 
     def go_address(self):
         # blur page when switching to navigation via address bar
@@ -2334,11 +3394,42 @@ class Browser:
 
     # -------- painting --------
     def draw(self):
+        """
+        Paint the current page, delegating to the active renderer.
+
+        In Skia mode (when a renderer with a draw_frame method exists), this
+        delegates drawing to the Skia renderer and returns immediately. In
+        Tk mode, it clears the Tk canvas and executes the display list to
+        draw widgets and the scrollbar.
+        """
+        # Before drawing, run one pending task for the active tab (if any).
+        try:
+            tab = self.current_tab()
+            if hasattr(tab, 'task_runner'):
+                tab.task_runner.run()
+        except Exception:
+            pass
+
+        # If a Skia renderer is active, let it handle drawing
+        rnd = getattr(self, "renderer", None)
+        if rnd is not None and hasattr(rnd, "draw_frame"):
+            try:
+                rnd.draw_frame()
+                return
+            except Exception:
+                pass
+        # Tk fallback: draw on canvas
         tab = self.current_tab()
-        self.canvas.delete("all")
-        for cmd in tab.display_list:
-            cmd.execute(tab.scroll, self.canvas)
-        self.draw_scrollbar(tab)
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.delete("all")
+            for cmd in tab.display_list:
+                cmd.execute(tab.scroll, canvas)
+            self.draw_scrollbar(tab)
+        except Exception:
+            pass
 
     def draw_scrollbar(self, tab: Tab):
         track_left = WIDTH - SCROLLBAR_WIDTH
@@ -2353,9 +3444,121 @@ class Browser:
         self.scrollbar_thumb = (track_left, thumb_y, WIDTH, thumb_y + thumb_h)
         self.canvas.create_rectangle(*self.scrollbar_thumb, width=1, outline="#bbb", fill="#ccc")
 
+    # ---- scheduling and rendering utilities ----
+    def set_needs_raster_and_draw(self) -> None:
+        """
+        Mark that the browser chrome and active tab need to be redrawn. This
+        sets a dirty flag so that the next call to raster_and_draw will
+        actually repaint. Tabs should call this after they change their
+        display list.
+        """
+        self.needs_raster_and_draw = True
+
+    def raster_and_draw(self) -> None:
+        """
+        Repaint the browser chrome and active tab if needed. This checks
+        the dirty flag set by set_needs_raster_and_draw and calls the
+        appropriate drawing routine (Tk or Skia). After painting, the
+        dirty flag is reset. If no repaint is needed, this returns
+        immediately.
+        """
+        if not getattr(self, 'needs_raster_and_draw', False):
+            return
+        try:
+            # Delegate to Skia renderer if present
+            rnd = getattr(self, 'renderer', None)
+            if rnd is not None and hasattr(rnd, 'draw_frame'):
+                rnd.draw_frame()
+            else:
+                # Fallback to Tk drawing
+                self.draw()
+        except Exception:
+            pass
+        # Clear the dirty flag
+        self.needs_raster_and_draw = False
+
+    def set_needs_animation_frame(self, tab: 'Tab') -> None:
+        """
+        Indicate that a new animation frame should be scheduled for the given
+        tab. Only the active tab can schedule a new animation frame; calls
+        from inactive tabs are ignored to avoid interfering with visible
+        content.
+        """
+        try:
+            if tab is getattr(self, 'active_tab', None):
+                self.needs_animation_frame = True
+        except Exception:
+            pass
+
+    def schedule_animation_frame(self) -> None:
+        """
+        Schedule a task to render the active tab on the next animation
+        frame. This sets up a timer that will execute after
+        REFRESH_RATE_SEC seconds and enqueues a render task on the
+        active tab's task runner. If an animation frame is already
+        scheduled or no frame is needed, this returns immediately.
+        """
+        try:
+            if not getattr(self, 'needs_animation_frame', False):
+                return
+            if getattr(self, 'animation_timer', None) is not None:
+                return
+
+            def callback():
+                # After the delay, enqueue a render task on the active tab
+                try:
+                    active_tab = getattr(self, 'active_tab', None)
+                    if active_tab and hasattr(active_tab, 'task_runner'):
+                        task = Task(active_tab.render)
+                        active_tab.task_runner.schedule_task(task)
+                except Exception:
+                    pass
+                # Reset timer and flag
+                self.animation_timer = None
+                self.needs_animation_frame = False
+            # Start a new timer for the next animation frame
+            self.animation_timer = threading.Timer(REFRESH_RATE_SEC, callback)
+            self.animation_timer.start()
+        except Exception:
+            pass
+
+    def run(self, url):
+        # Ensure we have a tab (works for both Skia and Tk paths)
+        if not getattr(self, "tabs", None):
+            self.tabs = []
+            self.active_tab_index = 0
+            self.active_tab = Tab(self)
+            self.tabs.append(self.active_tab)
+
+        # Load the start URL
+        self.active_tab.load(URL(url))
+
+        # If a non-Tk renderer (Skia) is active, use its event loop
+        if hasattr(self, "renderer") and hasattr(self.renderer, "mainloop"):
+            self.renderer.mainloop()
+            return
+
+        # Otherwise, fall back to Tk’s loop
+        self.window.mainloop()
+
+
+
 # ================= CLI =================
 if __name__ == "__main__":
-    app = Browser()
-    if len(sys.argv) == 2:
-        app.current_tab().navigate(URL(sys.argv[1]))
-    tkinter.mainloop()
+    import sys
+
+    # Optional: force Tk fallback for testing with --tk / --use-tk
+    force_tk = any(a in ("--tk", "--use-tk") for a in sys.argv)
+    if force_tk:
+        try:
+            SKIA_OK = False  # override Skia availability
+        except NameError:
+            pass
+        # remove the flag from argv
+        sys.argv = [a for a in sys.argv if a not in ("--tk", "--use-tk")]
+
+    url = sys.argv[1] if len(sys.argv) > 1 else "https://example.org"
+
+    browser = Browser()
+    browser.run(url)  # will choose Skia mainloop if available, else Tk
+

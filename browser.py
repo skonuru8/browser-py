@@ -4,6 +4,7 @@ import threading  # for timers and task scheduling
 import ctypes  # needed for Skia/SDL pointer handling
 import time
 import email.utils
+import math
 
 # Prefer Skia/SDL if available
 try:
@@ -48,6 +49,46 @@ if 'skia' in globals() and SKIA_OK:
     except Exception:
         _SKIA_TYPEFACE = None
 
+# Broken image placeholder: small red 'X' drawn via Skia.
+BROKEN_IMAGE = None
+if SKIA_OK:
+    try:
+        # Create a tiny surface and draw an 'X' to represent a broken image
+        _surf = skia.Surface(16, 16)
+        canvas = _surf.getCanvas()
+        # White background
+        paint = skia.Paint(Color=skia.ColorWHITE, Style=skia.Paint.kFill_Style)
+        canvas.drawRect(skia.Rect.MakeWH(16, 16), paint)
+        # Red 'X'
+        paint = skia.Paint(Color=skia.ColorRED, Style=skia.Paint.kStroke_Style)
+        paint.setStrokeWidth(2)
+        canvas.drawLine(0, 0, 16, 16, paint)
+        canvas.drawLine(16, 0, 0, 16, paint)
+        BROKEN_IMAGE = _surf.makeImageSnapshot()
+    except Exception:
+        BROKEN_IMAGE = None
+
+def parse_image_rendering(quality: str) -> 'skia.SamplingOptions':
+    """
+    Map CSS 'image-rendering' values to Skia SamplingOptions. High-quality uses
+    cubic resampling, crisp-edges uses nearest neighbor, and anything else uses
+    linear sampling. When Skia isn't available, returns None.
+    """
+    if not SKIA_OK:
+        return None  # type: ignore
+    try:
+        if quality == "high-quality":
+            return skia.SamplingOptions(skia.CubicResampler.Mitchell())
+        elif quality == "crisp-edges":
+            return skia.SamplingOptions(
+                skia.FilterMode.kNearest, skia.MipmapMode.kNone)
+        else:
+            return skia.SamplingOptions(
+                skia.FilterMode.kLinear, skia.MipmapMode.kLinear)
+    except Exception:
+        # Fallback: linear sampling
+        return skia.SamplingOptions(
+            skia.FilterMode.kLinear, skia.MipmapMode.kLinear)
 # Internal helper to construct a Skia Font with a non-deprecated typeface.
 # Always prefer _SKIA_TYPEFACE, and attempt a common fallback before
 # ultimately falling back to the deprecated default. This avoids warnings
@@ -85,6 +126,61 @@ def _get_skia_font(pt_size: int) -> 'skia.Font':
 # REFRESH_RATE_SEC seconds when an animation frame is requested. This
 # corresponds to ~30 frames per second. See Chapter 12 for details.
 REFRESH_RATE_SEC: float = 0.033
+
+# ========== Accessibility Helpers (Chapter 14) ==========
+def dpx(css_px: float, zoom: float) -> float:
+    """
+    Convert a CSS pixel measurement into device pixels by applying the
+    current zoom factor. A zoom of 1 leaves the measurement unchanged;
+    larger zooms scale up sizes and smaller zooms scale them down.
+
+    :param css_px: The length in CSS pixels.
+    :param zoom: The current zoom factor.
+    :return: The scaled length in device pixels.
+    """
+    try:
+        return css_px * zoom
+    except Exception:
+        # Fall back to original value if inputs are bad
+        return css_px
+
+def get_tabindex(node) -> int:
+    """
+    Return the tabindex of an element. A missing tabindex defaults to 0.
+    Negative tabindex means not keyboard focusable.
+    """
+    try:
+        if isinstance(node, Element):
+            if "tabindex" in node.attributes:
+                try:
+                    return int(node.attributes["tabindex"])
+                except Exception:
+                    return 0
+    except Exception:
+        pass
+    return 0
+
+def is_focusable(node) -> bool:
+    """
+    Determine whether a DOM node should be focusable via keyboard
+    navigation. Inputs (except hidden), buttons, and anchors are
+    focusable by default; other elements may be focusable if they have a
+    non-negative tabindex.
+    """
+    try:
+        if not isinstance(node, Element):
+            return False
+        if node.tag in ["input", "button", "a"]:
+            # Hidden inputs are not focusable
+            if node.tag == "input" and \
+               node.attributes.get("type", "text").lower() == "hidden":
+                return False
+            return True
+        # tabindex < 0 means explicitly not focusable
+        idx = get_tabindex(node)
+        return idx >= 0
+    except Exception:
+        return False
 
 
 # Optional dependency for JavaScript execution. DukPy wraps the Duktape
@@ -267,17 +363,24 @@ class URL:
         # Send request
         s.send(req.encode("utf8"))
         # Read response
-        resp = s.makefile("r", encoding="utf8", newline="\r\n")
+        # Read response in binary mode. Header lines are decoded, body is left as bytes.
+        resp = s.makefile("b")
         # Status line
-        _ = resp.readline()
+        _ = resp.readline().decode("utf8", "ignore")
         headers: dict[str, str] = {}
         while True:
             line = resp.readline()
-            if line == "\r\n" or line == "":
+            if not line:
                 break
-            if ":" not in line:
+            try:
+                line_str = line.decode("utf8", "ignore")
+            except Exception:
                 continue
-            k, v = line.split(":", 1)
+            if line_str == "\r\n":
+                break
+            if ":" not in line_str:
+                continue
+            k, v = line_str.split(":", 1)
             k_lower = k.casefold()
             v = v.strip()
             # Collect duplicate headers (e.g., Set-Cookie)
@@ -285,7 +388,7 @@ class URL:
                 headers[k_lower] += ", " + v
             else:
                 headers[k_lower] = v
-        # No transfer-encoding or content-encoding expected
+        # Read the rest of the body as bytes
         body = resp.read()
         s.close()
         # Store cookies from Set-Cookie header
@@ -772,12 +875,23 @@ class DocumentLayout:
         self.parent = None
         self.children = []
         self.x = self.y = self.width = self.height = None
-    def layout(self):
+        # Zoom factor for sizing page elements. Default 1.0; parent Tab will
+        # set this before calling layout().
+        self.zoom: float = 1.0
+    def layout(self, zoom: float | None = None):
+        """Lay out the document. Accepts an optional zoom parameter to
+        scale CSS sizes. The zoom factor is stored on this object and
+        propagated to child layout objects."""
+        # Update zoom if provided
+        if zoom is not None:
+            self.zoom = zoom
         child = BlockLayout(self.node, self, None)
         self.children = [child]
-        self.width = WIDTH - 2*HSTEP - SCROLLBAR_WIDTH
-        self.x = HSTEP
-        self.y = VSTEP
+        # Compute width and position scaled by zoom
+        # Subtract space for horizontal padding and scrollbar
+        self.width = (WIDTH - SCROLLBAR_WIDTH) - 2 * dpx(HSTEP, self.zoom)
+        self.x = dpx(HSTEP, self.zoom)
+        self.y = dpx(VSTEP, self.zoom)
         child.layout()
         self.height = child.height
     def paint(self): return []
@@ -796,13 +910,22 @@ class BlockLayout:
         self.line = []
 
     def layout_mode(self):
-        if isinstance(self.node, Text): return "inline"
-        elif any(isinstance(c, Element) and c.tag in BLOCK_ELEMENTS for c in self.node.children): return "block"
-        elif self.node.children or (isinstance(self.node, Element) and self.node.tag in ["input","button"]):
+        # Determine the layout mode for this node. Text nodes always
+        # render inline. Elements with block children render as blocks.
+        # Inputs, buttons, and images render inline. Otherwise, blocks.
+        if isinstance(self.node, Text):
             return "inline"
-        else: return "block"
+        elif any(isinstance(c, Element) and c.tag in BLOCK_ELEMENTS for c in self.node.children):
+            return "block"
+        elif self.node.children or (isinstance(self.node, Element) and self.node.tag in ["input", "button", "img"]):
+            return "inline"
+        else:
+            return "block"
 
     def layout(self):
+        # Copy zoom from parent (DocumentLayout or another BlockLayout)
+        self.zoom = getattr(self.parent, 'zoom', 1.0)
+        # Position inherits from parent scaled positions
         self.x = self.parent.x
         self.width = self.parent.width
         self.y = (self.previous.y + self.previous.height) if self.previous else self.parent.y
@@ -861,6 +984,9 @@ class BlockLayout:
                     self.flush()
                 else:
                     self.input(node)
+            elif isinstance(node, Element) and node.tag == "img":
+                # Handle inline images
+                self.image(node)
             else:
                 for c in node.children:
                     self.recurse(c)
@@ -869,8 +995,15 @@ class BlockLayout:
         weight = node.style["font-weight"]
         style = node.style["font-style"]
         if style == "normal": style = "roman"
-        size = int(float(node.style["font-size"][:-2]) * .75)
-        font = get_font(size, weight, style)
+        # Compute font size in points. CSS pixels are multiplied by 0.75 to
+        # convert to points, then scaled by zoom via dpx(). This yields a
+        # consistent font size under zoom.
+        try:
+            px_size = float(node.style["font-size"][:-2])
+        except Exception:
+            px_size = 16.0
+        size_pt = dpx(px_size * 0.75, getattr(self, 'zoom', 1.0))
+        font = get_font(int(size_pt), weight, style)
         color = node.style["color"]
         w = font.measure(word)
         if self.cursor_x + w > self.width:
@@ -884,16 +1017,28 @@ class BlockLayout:
         # Exercise 10-1: Hidden inputs do not take up space or draw anything
         if itype == "hidden":
             return
-        # compute font used inside widget
+        # compute font used inside widget, scaling size by zoom
         weight = node.style["font-weight"]
         style = node.style["font-style"]
         if style == "normal": style = "roman"
-        size = int(float(node.style["font-size"][:-2]) * .75)
-        font = get_font(size, weight, style)
+        try:
+            px_size = float(node.style["font-size"][:-2])
+        except Exception:
+            px_size = 16.0
+        size_pt = dpx(px_size * 0.75, getattr(self, 'zoom', 1.0))
+        font = get_font(int(size_pt), weight, style)
 
-        # size by type
+        # size by type (scale checkbox and input widths by zoom)
         is_checkbox = itype == "checkbox"
-        w = CHECKBOX_SIZE if is_checkbox else (INPUT_WIDTH_PX if node.tag == "input" else max(80, font.measure(self.button_label(node)) + 20))
+        # Determine widget width: checkbox size or input width scaled by zoom.
+        if is_checkbox:
+            w = dpx(CHECKBOX_SIZE, getattr(self, 'zoom', 1.0))
+        else:
+            if node.tag == "input":
+                base_w = INPUT_WIDTH_PX
+            else:
+                base_w = max(80, font.measure(self.button_label(node)) + 20)
+            w = dpx(base_w, getattr(self, 'zoom', 1.0))
 
         if self.cursor_x + w > self.width:
             self.flush()
@@ -902,8 +1047,11 @@ class BlockLayout:
         max_ascent = metrics["ascent"]
         baseline = self.cursor_y + max_ascent
         x = self.x + self.cursor_x
+        # Compute vertical extents, scaling checkbox height by zoom
         y_top = self.y + baseline - font.metrics("ascent")
-        y_bottom = y_top + (CHECKBOX_SIZE if is_checkbox else font.metrics("linespace"))
+        # Height: checkbox size or font line spacing scaled by zoom
+        h = dpx(CHECKBOX_SIZE, getattr(self, 'zoom', 1.0)) if is_checkbox else font.metrics("linespace")
+        y_bottom = y_top + h
         rect = (x, y_top, x + w, y_bottom)
 
         # register for hit-testing
@@ -944,6 +1092,79 @@ class BlockLayout:
                 self.display_list.append(("line", (cx, y_top, cx, y_bottom, "black", 1)))
 
         # advance cursor
+        self.cursor_x += w + font.measure(" ")
+
+    def image(self, node):
+        """
+        Handle inline <img> elements by reserving space for the image and
+        adding an image draw command to the display list. Images are aligned
+        on the text baseline; their bottom aligns with the baseline of the
+        current line.
+        """
+        # Skip images with no loaded image object
+        if not getattr(node, "image", None):
+            # If no image is available, don't take up space; optionally draw nothing
+            return
+        # Determine font for baseline alignment and space width
+        weight = node.style.get("font-weight", "normal")
+        style = node.style.get("font-style", "normal")
+        if style == "normal":
+            style = "roman"
+        size_str = node.style.get("font-size", "16px")
+        try:
+            px_size = float(size_str[:-2])
+        except Exception:
+            px_size = 16.0
+        size_pt = dpx(px_size * 0.75, getattr(self, 'zoom', 1.0))
+        font = get_font(int(size_pt), weight, style)
+        # Determine image width/height, respecting width/height attributes
+        try:
+            image_width = node.image.width() if node.image else 0
+            image_height = node.image.height() if node.image else 0
+        except Exception:
+            image_width = 0; image_height = 0
+        aspect_ratio = image_width / image_height if image_height else 1.0
+        width_attr = node.attributes.get("width")
+        height_attr = node.attributes.get("height")
+        if width_attr and height_attr:
+            try:
+                w = dpx(int(width_attr), getattr(self, 'zoom', 1.0))
+            except Exception:
+                w = dpx(image_width, getattr(self, 'zoom', 1.0))
+            try:
+                img_h = dpx(int(height_attr), getattr(self, 'zoom', 1.0))
+            except Exception:
+                img_h = dpx(image_height, getattr(self, 'zoom', 1.0))
+        elif width_attr:
+            try:
+                w = dpx(int(width_attr), getattr(self, 'zoom', 1.0))
+            except Exception:
+                w = dpx(image_width, getattr(self, 'zoom', 1.0))
+            img_h = w / aspect_ratio if aspect_ratio else dpx(image_height, getattr(self, 'zoom', 1.0))
+        elif height_attr:
+            try:
+                img_h = dpx(int(height_attr), getattr(self, 'zoom', 1.0))
+            except Exception:
+                img_h = dpx(image_height, getattr(self, 'zoom', 1.0))
+            w = img_h * aspect_ratio if aspect_ratio else dpx(image_width, getattr(self, 'zoom', 1.0))
+        else:
+            w = dpx(image_width, getattr(self, 'zoom', 1.0))
+            img_h = dpx(image_height, getattr(self, 'zoom', 1.0))
+        # Flush line if necessary
+        if self.cursor_x + w > self.width:
+            self.flush()
+        # Compute baseline: align bottom of image with baseline
+        metrics = font.metrics()
+        max_ascent = metrics["ascent"]
+        baseline = self.cursor_y + max_ascent
+        x = self.x + self.cursor_x
+        y_bottom = self.y + baseline
+        y_top = y_bottom - img_h
+        rect = (x, y_top, x + w, y_bottom)
+        # Append to display list: ("image", rect, image, quality)
+        quality = node.style.get("image-rendering", "auto")
+        self.display_list.append(("image", rect, node.image, quality))
+        # Advance cursor, including space after image
         self.cursor_x += w + font.measure(" ")
 
     def button_label(self, node):
@@ -989,7 +1210,7 @@ class BlockLayout:
         return Rect(self.x, self.y, right, bottom)
 
     def should_paint(self):
-        if isinstance(self.node, Element) and self.node.tag in ["input","button"]:
+        if isinstance(self.node, Element) and self.node.tag in ["input","button","img"]:
             return False
         return True
 
@@ -1023,6 +1244,12 @@ class BlockLayout:
             elif item[0] == "outline":
                 _, (x1,y1,x2,y2), color, th = item
                 cmds.append(DrawOutline(x1, y1, x2, y2, color, th))
+            elif item[0] == "image":
+                _, (x1,y1,x2,y2), image_obj, quality = item
+                rect = (x1, y1, x2, y2)
+                # Create draw command for images; compute sampling options
+                qual = parse_image_rendering(quality) if SKIA_OK else None
+                cmds.append(DrawImage(rect, image_obj, qual))
         return cmds
 
 # ================= Inline layout classes (Chapter 7+ compatibility) =================
@@ -1290,6 +1517,51 @@ class DrawOutline:
     def execute(self, scroll, canvas):
         canvas.create_rectangle(self.x1, self.y1 - scroll, self.x2, self.y2 - scroll,
                                 outline=self.color, width=self.thickness)
+
+# New draw command to render images. The rect is specified as a tuple
+# (x1, y1, x2, y2). When drawing in Skia mode, this command invokes
+# drawImageRect on the underlying Skia canvas. In Tk mode, images are
+# not drawn (Tk doesn't support arbitrary image formats). The quality
+# field holds SamplingOptions computed from the CSS 'image-rendering'
+# property.
+class DrawImage:
+    def __init__(self, rect, image, quality):
+        # rect is (x1, y1, x2, y2)
+        self.rect = rect
+        self.image = image
+        self.quality = quality
+    def execute(self, scroll, canvas):
+        # Skip drawing if no image or no canvas
+        if self.image is None or canvas is None:
+            return
+        # Determine if we're in Skia mode via the adapter
+        # When using SkiaCanvasAdapter, we have a 'canvas' attribute
+        if hasattr(canvas, "canvas"):
+            try:
+                x1, y1, x2, y2 = self.rect
+                # Adjust for scroll
+                r = skia.Rect.MakeLTRB(x1, y1 - scroll, x2, y2 - scroll)
+                sampling = self.quality
+                # Draw the image
+                canvas.canvas.drawImageRect(self.image, r, sampling)
+            except Exception:
+                pass
+        else:
+            # In Tk mode, draw a placeholder rectangle; actual image
+            # rendering is not supported without PIL. This prevents
+            # crashes when encountering <img> tags in Tk.
+            try:
+                x1, y1, x2, y2 = self.rect
+                # Use a light gray rectangle as placeholder
+                canvas.create_rectangle(x1, y1 - scroll, x2, y2 - scroll,
+                                        width=0, fill="#ddd")
+                # Optionally, draw an 'X' to indicate a missing image
+                canvas.create_line(x1, y1 - scroll, x2, y2 - scroll,
+                                   fill="#888", width=1)
+                canvas.create_line(x2, y1 - scroll, x1, y2 - scroll,
+                                   fill="#888", width=1)
+            except Exception:
+                pass
 
 # ================= JavaScript runtime & context =================
 # The following strings define a minimal DOM-like API implemented in
@@ -1888,9 +2160,8 @@ class JSContext:
             # If this is an asynchronous XHR, schedule the onload callback
             if isasync and handle is not None:
                 try:
-                    # Create a task to call dispatch_xhr_onload. Note that
-                    # out may be bytes or str; we ensure a str is passed.
-                    resp_str = out.decode('utf-8', errors='ignore') if isinstance(out, bytes) else out
+                    # Create a task to call dispatch_xhr_onload. Convert bytes to str.
+                    resp_str = out.decode('utf-8', errors='ignore') if isinstance(out, (bytes, bytearray)) else out
                     task = Task(self.dispatch_xhr_onload, resp_str, handle)
                     self.tab.task_runner.schedule_task(task)
                 except Exception:
@@ -1902,7 +2173,14 @@ class JSContext:
         # thread; the result will be delivered via dispatch_xhr_onload.
         try:
             if not isasync:
-                return run_load()
+                # Synchronous requests: return decoded body
+                result = run_load()
+                try:
+                    if isinstance(result, (bytes, bytearray)):
+                        result = result.decode('utf-8', 'replace')
+                except Exception:
+                    pass
+                return result
             else:
                 threading.Thread(target=run_load).start()
                 # Return an empty string to JS for async requests; the
@@ -2140,6 +2418,21 @@ class Tab:
         self.task_runner = TaskRunner(self)
         # Dirty flag indicating whether render needs to recompute layout
         self.needs_render = False
+
+        # ----- Accessibility features (Chapter 14) -----
+        # Zoom factor for this tab. A zoom of 1.0 means no scaling; larger
+        # numbers enlarge fonts and element sizes. When zoom changes we
+        # need to mark the tab as needing render so layout is recomputed.
+        self.zoom: float = 1.0
+        # Dark mode flag for the tab. Each tab tracks whether it should
+        # draw using dark colors. It mirrors the Browser.dark_mode value
+        # when the tab is created or when dark mode toggles.
+        self.dark_mode: bool = getattr(browser, 'dark_mode', False)
+        # Whether the tab needs to scroll the focused element into view
+        # on the next animation frame. When focus changes this is set
+        # and then cleared during the render loop. Not fully implemented
+        # here but defined for completeness.
+        self.needs_focus_scroll: bool = False
         if home_url: self.navigate(home_url)
 
     def navigate(self, url, method="GET", body=None):
@@ -2214,6 +2507,13 @@ class Tab:
             self.browser.set_status("Loading…")
             # Perform the network request, capturing headers and body
             headers, body = url.request(referrer=referrer, payload=payload)
+            # Decode textual responses; leave binary data as bytes
+            try:
+                if isinstance(body, (bytes, bytearray)):
+                    body = body.decode("utf8", "replace")
+            except Exception:
+                # Leave body as-is if decode fails
+                pass
             self.browser.set_status("")
         except ssl.SSLError:
             # Certificate error
@@ -2260,6 +2560,57 @@ class Tab:
         # Parse HTML document
         self.nodes = HTMLParser(body).parse()
         self.title = self._extract_title() or f"{url.host}"
+
+        # Reset zoom and adopt current browser dark mode when navigating
+        # to a new page. This ensures each page starts at 100% zoom and
+        # inherits the dark mode state of the browser.
+        try:
+            self.zoom = 1.0
+            self.dark_mode = getattr(self.browser, 'dark_mode', False)
+            # Clear focus on navigation
+            self.focus_element(None)
+        except Exception:
+            pass
+        # Before processing scripts and styles, load images for all <img> tags.
+        try:
+            # Iterate over all img elements in the DOM and download images
+            imgs = [n for n in tree_to_list(self.nodes, []) if isinstance(n, Element) and n.tag == "img"]
+            for img in imgs:
+                src = img.attributes.get("src", "")
+                if not src:
+                    continue
+                try:
+                    img_url = url.resolve(src)
+                except Exception:
+                    continue
+                # Check CSP
+                if not self.allowed_request(img_url):
+                    continue
+                # Fetch image bytes without decoding
+                try:
+                    h_img, img_body = img_url.request(referrer=str(url), payload=None, origin=None)
+                except Exception:
+                    # network error; use broken placeholder
+                    img.image = BROKEN_IMAGE
+                    continue
+                # Only process images when Skia is available
+                if SKIA_OK:
+                    try:
+                        # Ensure we have bytes; convert to Skia image
+                        data = skia.Data.MakeWithoutCopy(img_body)
+                        img_obj = skia.Image.MakeFromEncoded(data)
+                        if not img_obj:
+                            raise Exception("decode failed")
+                        img.encoded_data = img_body
+                        img.image = img_obj
+                    except Exception:
+                        # Use broken image placeholder
+                        img.image = BROKEN_IMAGE
+                else:
+                    # If Skia is not available, mark as missing
+                    img.image = None
+        except Exception:
+            pass
         # Initialize JavaScript context
         if dukpy is not None:
             # Discard any existing JS context so that pending timers
@@ -2334,8 +2685,26 @@ class Tab:
         # Clear widget hit-test boxes
         Browser._clear_widget_boxes()
         # Layout and paint
+        # When dark mode is active, flip the default text color. The
+        # INHERITED_PROPERTIES dictionary determines the base values
+        # for font-size, weight, style and color. Override the color
+        # here so style() picks up the right default before computing
+        # cascaded styles.
+        try:
+            if self.dark_mode:
+                INHERITED_PROPERTIES["color"] = "white"
+            else:
+                INHERITED_PROPERTIES["color"] = "black"
+        except Exception:
+            pass
         self.document = DocumentLayout(self.nodes)
-        self.document.layout()
+        # Use current zoom when laying out the document. DocumentLayout
+        # stores the zoom factor and applies it to paddings and widths.
+        try:
+            self.document.layout(getattr(self, 'zoom', 1.0))
+        except Exception:
+            # Fallback: call layout without zoom
+            self.document.layout()
         self.display_list = []
         paint_tree(self.document, self.display_list)
         self.doc_height = self.document.height
@@ -2402,6 +2771,12 @@ class Tab:
                     # JS cancelled default
                     self.apply_styles_and_render()
                     return
+            # If this element is focusable, set focus on it first
+            try:
+                if is_focusable(elt):
+                    self.focus_element(elt)
+            except Exception:
+                pass
             # Handle input elements: toggle checkboxes or focus text inputs
             if elt.tag == "input":
                 # checkbox click toggles; text input focuses
@@ -2419,8 +2794,7 @@ class Tab:
                     return
                 # text input focus & clear
                 elt.attributes["value"] = ""
-                self.focus = elt
-                elt.is_focused = True
+                # focus already set via focus_element
                 self.apply_styles_and_render()
                 return
 
@@ -2529,6 +2903,136 @@ class Tab:
             self.focus.is_focused = False
             self.focus = None
 
+    # ----- Chapter 14: accessibility helpers -----
+    def zoom_by(self, increment: bool) -> None:
+        """Adjust the zoom factor for this tab. If increment is True,
+        increase zoom by 10%; otherwise decrease it by 10%. Adjust the
+        scroll position proportionally so the page appears anchored.
+
+        :param increment: True to zoom in, False to zoom out.
+        """
+        try:
+            if increment:
+                self.zoom *= 1.1
+                self.scroll *= 1.1
+            else:
+                self.zoom /= 1.1
+                self.scroll /= 1.1
+            # Mark for re-render and scroll update
+            self.set_needs_render()
+        except Exception:
+            pass
+
+    def reset_zoom(self) -> None:
+        """Reset zoom to 1.0 and adjust scroll accordingly."""
+        try:
+            if self.zoom != 0:
+                self.scroll /= self.zoom
+            self.zoom = 1.0
+            self.set_needs_render()
+        except Exception:
+            pass
+
+    def set_dark_mode(self, val: bool) -> None:
+        """Set dark mode for this tab and mark for re-render."""
+        self.dark_mode = bool(val)
+        self.set_needs_render()
+
+    def focus_element(self, node) -> None:
+        """Change the focused element. Clears the previous focus and
+        assigns focus to the new node, setting its is_focused flag. Also
+        marks that the focused element should be scrolled into view on
+        the next render."""
+        try:
+            if self.focus and hasattr(self.focus, 'is_focused'):
+                self.focus.is_focused = False
+            self.focus = node
+            if node and hasattr(node, 'is_focused'):
+                node.is_focused = True
+                self.needs_focus_scroll = True
+            else:
+                self.needs_focus_scroll = False
+            # Re-render to show focus changes (outline etc.)
+            self.set_needs_render()
+        except Exception:
+            pass
+
+    def advance_tab(self, reverse: bool = False) -> None:
+        """Cycle focus to the next (or previous if reverse) focusable element.
+        If there are no focusable elements or we cycle past the last one,
+        clear focus and move focus to the address bar. Focusable
+        elements are determined by is_focusable()."""
+        try:
+            # Collect focusable nodes in document order
+            focusable = []
+            for n in tree_to_list(self.nodes, []):
+                if isinstance(n, Element) and is_focusable(n):
+                    focusable.append(n)
+            if not focusable:
+                # Nothing to focus; clear focus and send to address bar
+                self.focus_element(None)
+                try:
+                    self.browser.focus_addressbar()
+                except Exception:
+                    pass
+                return
+            # Determine current index
+            if self.focus and self.focus in focusable:
+                cur_idx = focusable.index(self.focus)
+                next_idx = cur_idx - 1 if reverse else cur_idx + 1
+            else:
+                next_idx = 0 if not reverse else len(focusable) - 1
+            # Wrap around
+            if next_idx < 0 or next_idx >= len(focusable):
+                # Move focus to chrome (address bar) if we wrap
+                self.focus_element(None)
+                try:
+                    self.browser.focus_addressbar()
+                except Exception:
+                    pass
+            else:
+                # Focus next element
+                self.focus_element(focusable[next_idx])
+        except Exception:
+            pass
+
+    def activate_element(self, elt) -> None:
+        """Activate a focusable element. The default behaviour is
+        equivalent to clicking it: inputs are cleared; anchors navigate
+        to their href; buttons submit their enclosing form. This is
+        called when the user presses Enter on a focused element."""
+        if not elt or not isinstance(elt, Element):
+            return
+        try:
+            tag = elt.tag
+            if tag == 'input':
+                # Clear the input value when activated
+                elt.attributes['value'] = ''
+                self.set_needs_render()
+            elif tag == 'a' and 'href' in elt.attributes:
+                try:
+                    dest = self.url.resolve(elt.attributes['href'])
+                    self.load(dest)
+                except Exception:
+                    pass
+            elif tag == 'button':
+                # find enclosing form and submit
+                parent = elt.parent
+                while parent and not (isinstance(parent, Element) and parent.tag == 'form'):
+                    parent = parent.parent
+                if parent:
+                    self.submit_form(parent)
+        except Exception:
+            pass
+
+    def enter(self) -> None:
+        """Handle Enter key: activate current focused element if any."""
+        try:
+            if self.focus:
+                self.activate_element(self.focus)
+        except Exception:
+            pass
+
     # -------- script/style processing --------
     def process_scripts_and_styles(self) -> None:
         """
@@ -2567,6 +3071,12 @@ class Tab:
                                 ref = str(self.url) if self.url else None
                                 origin = self.url.origin() if self.url else None
                                 h, body = script_url.request(referrer=ref, payload=None, origin=origin)
+                                # Decode script text if bytes
+                                try:
+                                    if isinstance(body, (bytes, bytearray)):
+                                        body = body.decode("utf8", "replace")
+                                except Exception:
+                                    pass
                                 # Instead of running the script immediately,
                                 # schedule a task to run it later. This keeps
                                 # the UI responsive and defers script
@@ -2602,6 +3112,12 @@ class Tab:
                                 ref = str(self.url) if self.url else None
                                 origin_header = self.url.origin() if self.url else None
                                 h, css_body = css_url.request(referrer=ref, payload=None, origin=origin_header)
+                                # Decode CSS body if bytes
+                                try:
+                                    if isinstance(css_body, (bytes, bytearray)):
+                                        css_body = css_body.decode("utf8", "replace")
+                                except Exception:
+                                    pass
                                 parser = CSSParser(css_body)
                                 rules = parser.parse()
                             except Exception:
@@ -2746,9 +3262,16 @@ class SkiaRenderer:
         self._secure = False
 
     def draw_frame(self):
-        # clear root
+        # clear root with dark or light background
         rootc = self.surface_root.getCanvas()
-        rootc.clear(skia.ColorWHITE)
+        try:
+            if getattr(self.browser, 'dark_mode', False):
+                root_bg = skia.ColorBLACK
+            else:
+                root_bg = skia.ColorWHITE
+        except Exception:
+            root_bg = skia.ColorWHITE
+        rootc.clear(root_bg)
 
         # draw chrome
         rootc.drawRect(skia.Rect.MakeLTRB(0, 0, WIDTH, self.chrome_h),
@@ -2772,9 +3295,16 @@ class SkiaRenderer:
             # If anything goes wrong (e.g., typeface unavailable), ignore
             pass
 
-        # draw tab contents on tab surface
+        # draw tab contents on tab surface; background depends on dark mode
         tabc = self.surface_tab.getCanvas()
-        tabc.clear(skia.ColorWHITE)
+        try:
+            if getattr(self.browser, 'dark_mode', False):
+                tab_bg = skia.ColorBLACK
+            else:
+                tab_bg = skia.ColorWHITE
+        except Exception:
+            tab_bg = skia.ColorWHITE
+        tabc.clear(tab_bg)
 
         # Let browser build its display list (same as Tk path) and execute on a SkiaCanvasAdapter
         # Clear previously registered widget boxes so hit-testing only uses
@@ -3004,6 +3534,12 @@ class Browser:
         self.needs_animation_frame: bool = True
         # Handle to an in-flight timer that schedules the next animation frame.
         self.animation_timer = None
+
+        # ----- Accessibility state -----
+        # Global dark mode flag controlling whether the browser chrome and
+        # pages use dark colors. Tabs copy this when created and when
+        # toggled via toggle_dark_mode().
+        self.dark_mode: bool = False
         # --- choose renderer early (GPU preferred) ---
         global TK_ACTIVE
         use_skia = False
@@ -3264,16 +3800,56 @@ class Browser:
 
 
     def handle_key(self, e):
-        widget = self.window.focus_get()
-        if widget is self.address:
-            # address bar focused; page must be blurred
-            self.chrome_ctl.focus = "address bar"
-            self.current_tab().blur()  # 8-3
-            return
-        self.chrome_ctl.focus = None
-        if e.char:
-            self.current_tab().keypress(e.char)
-            self.draw()
+        """Handle key presses in Tk mode. Supports Ctrl-based commands
+        for zoom and dark mode, Tab to cycle focus, Enter to activate
+        elements, and passes other printable characters to the page.
+        """
+        try:
+            widget = self.window.focus_get()
+            # If address bar has focus, let Enter submit address; Ctrl
+            # shortcuts still apply though
+            ctrl_down = bool(e.state & 0x4)
+            keysym = getattr(e, 'keysym', None)
+            # Ctrl shortcuts for zoom and dark mode
+            if ctrl_down:
+                if keysym in ('plus', 'equal'):  # Ctrl + or =
+                    self.increment_zoom(True)
+                    return
+                elif keysym in ('minus', 'underscore'):
+                    self.increment_zoom(False)
+                    return
+                elif keysym == '0':
+                    self.reset_zoom()
+                    return
+                elif keysym == 'd':
+                    self.toggle_dark_mode()
+                    return
+                elif keysym == 't':
+                    # New tab
+                    self.new_tab(URL("https://example.org/"))
+                    return
+                elif keysym == 'Tab':
+                    # Ctrl-Tab cycles tabs; handled by _bind_accels
+                    return
+                # Other Ctrl combos fall through
+            # Non-Ctrl keys
+            if keysym == 'Tab':
+                # Tab cycles focus on page
+                self.handle_tab()
+                return
+            if keysym in ('Return', 'KP_Enter'):
+                self.handle_enter()
+                return
+            # When address bar is focused, send printable characters to it
+            if widget is self.address:
+                # Let Tk handle the text entry; do nothing
+                return
+            # Otherwise forward printable characters to page
+            if e.char and len(e.char) == 1 and ord(e.char) >= 32:
+                self.current_tab().keypress(e.char)
+                self.draw()
+        except Exception:
+            pass
 
     def handle_enter(self):
         widget = self.window.focus_get()
@@ -3424,6 +4000,11 @@ class Browser:
         if canvas is None:
             return
         try:
+            # Set canvas background according to dark mode
+            if self.dark_mode:
+                canvas.configure(background="black")
+            else:
+                canvas.configure(background="white")
             canvas.delete("all")
             for cmd in tab.display_list:
                 cmd.execute(tab.scroll, canvas)
@@ -3540,6 +4121,95 @@ class Browser:
 
         # Otherwise, fall back to Tk’s loop
         self.window.mainloop()
+
+    # ----- Accessibility & keyboard commands -----
+    def increment_zoom(self, increment: bool) -> None:
+        """Zoom the current page in or out by 10%. Enqueues a zoom task on
+        the active tab so it executes on the main thread."""
+        try:
+            tab = getattr(self, 'active_tab', None)
+            if tab and hasattr(tab, 'task_runner'):
+                task = Task(tab.zoom_by, increment)
+                tab.task_runner.schedule_task(task)
+        except Exception:
+            pass
+
+    def reset_zoom(self) -> None:
+        """Reset zoom on the active tab to 100%."""
+        try:
+            tab = getattr(self, 'active_tab', None)
+            if tab and hasattr(tab, 'task_runner'):
+                task = Task(tab.reset_zoom)
+                tab.task_runner.schedule_task(task)
+        except Exception:
+            pass
+
+    def toggle_dark_mode(self) -> None:
+        """Toggle dark mode for the browser. Updates the global flag and
+        notifies the active tab. Tabs copy this flag on creation."""
+        try:
+            self.dark_mode = not self.dark_mode
+            # Schedule a task to update dark mode on the active tab
+            tab = getattr(self, 'active_tab', None)
+            if tab and hasattr(tab, 'task_runner'):
+                task = Task(tab.set_dark_mode, self.dark_mode)
+                tab.task_runner.schedule_task(task)
+            # Redraw chrome / page to reflect new colors
+            self.draw()
+        except Exception:
+            pass
+
+    def handle_tab(self) -> None:
+        """Handle Tab key: advance focus within the page. Schedules
+        advance_tab on the active tab."""
+        try:
+            tab = getattr(self, 'active_tab', None)
+            if tab and hasattr(tab, 'task_runner'):
+                task = Task(tab.advance_tab)
+                tab.task_runner.schedule_task(task)
+        except Exception:
+            pass
+
+    def handle_enter(self) -> None:
+        """Handle Enter key: if the address bar is focused, navigate;
+        otherwise activate the focused element in the page."""
+        try:
+            # In Tk, we can check which widget has focus
+            widget = getattr(self, 'window', None).focus_get() if hasattr(self, 'window') else None
+            # If the address bar is focused, go to the URL
+            if widget is getattr(self, 'address', None):
+                self.go_address()
+            else:
+                tab = getattr(self, 'active_tab', None)
+                if tab and hasattr(tab, 'task_runner'):
+                    task = Task(tab.enter)
+                    tab.task_runner.schedule_task(task)
+        except Exception:
+            pass
+
+    def focus_addressbar(self) -> None:
+        """Move focus to the address bar and select all its text."""
+        try:
+            addr = getattr(self, 'address', None)
+            if addr is not None:
+                addr.focus_set()
+                addr.selection_range(0, 'end')
+            # Also blur the current tab's page
+            tab = getattr(self, 'active_tab', None)
+            if tab:
+                tab.blur()
+        except Exception:
+            pass
+
+    def cycle_tabs(self) -> None:
+        """Cycle to the next tab in the tab bar."""
+        try:
+            if not self.tabs:
+                return
+            new_idx = (self.active_tab_index + 1) % len(self.tabs)
+            self.switch_tab(new_idx)
+        except Exception:
+            pass
 
 
 

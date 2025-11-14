@@ -1,15 +1,14 @@
 import socket
 import ssl
 import sys
+import tkinter
 
 
 class URL:
     def __init__(self, url):
-        # Split scheme and rest
         self.scheme, rest = url.split("://", 1)
         assert self.scheme in ["http", "https"]
 
-        # Split host[:port] and path
         if "/" in rest:
             host_port, path = rest.split("/", 1)
             self.path = "/" + path
@@ -17,7 +16,6 @@ class URL:
             host_port = rest
             self.path = "/"
 
-        # Handle optional port
         if ":" in host_port:
             host, port = host_port.split(":", 1)
             self.host = host
@@ -27,7 +25,6 @@ class URL:
             self.port = 80 if self.scheme == "http" else 443
 
     def request(self):
-        # Create TCP socket
         s = socket.socket(
             family=socket.AF_INET,
             type=socket.SOCK_STREAM,
@@ -35,23 +32,18 @@ class URL:
         )
         s.connect((self.host, self.port))
 
-        # Wrap in TLS for HTTPS
         if self.scheme == "https":
             ctx = ssl.create_default_context()
             s = ctx.wrap_socket(s, server_hostname=self.host)
 
-        # Build HTTP/1.0 request
         request = f"GET {self.path} HTTP/1.0\r\nHost: {self.host}\r\n\r\n"
         s.send(request.encode("utf8"))
 
-        # Read response
         response = s.makefile("r", encoding="utf8", newline="\r\n")
 
-        # Status line
         statusline = response.readline()
         version, status, explanation = statusline.split(" ", 2)
 
-        # Headers
         headers = {}
         while True:
             line = response.readline()
@@ -60,34 +52,49 @@ class URL:
             header, value = line.split(":", 1)
             headers[header.lower()] = value.strip()
 
-        # No compression or chunking in chapter 1
         assert "transfer-encoding" not in headers
         assert "content-encoding" not in headers
 
-        # Body
         body = response.read()
         s.close()
         return body
 
 
-def show(body):
-    in_tag = False
-    for c in body:
-        if c == "<":
-            in_tag = True
-        elif c == ">":
-            in_tag = False
-        elif not in_tag:
-            print(c, end="")
+class Browser:
+    def __init__(self):
+        self.window = tkinter.Tk()
+        self.canvas = tkinter.Canvas(self.window, width=800, height=600)
+        self.canvas.pack()
 
+    def load(self, url):
+        body = URL(url).request()
+        self.display(body)
 
-def load(url):
-    body = URL(url).request()
-    show(body)
+    def display(self, body):
+        # Chapter 2: lay out text one word at a time
+        cursor_x, cursor_y = 13, 18
+        line_height = 18
+
+        for word in body.split():
+            word += " "
+            w = self.canvas.create_text(cursor_x, cursor_y, text=word, anchor="nw")
+            bounds = self.canvas.bbox(w)
+            if bounds[2] >= 800:  # word exceeds width
+                self.canvas.delete(w)
+                cursor_y += line_height
+                cursor_x = 13
+                w = self.canvas.create_text(cursor_x, cursor_y, text=word, anchor="nw")
+                bounds = self.canvas.bbox(w)
+            cursor_x = bounds[2]
+
+    def run(self, url):
+        self.load(url)
+        self.window.mainloop()
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: python browser.py URL")
         sys.exit(1)
-    load(sys.argv[1])
+
+    Browser().run(sys.argv[1])
